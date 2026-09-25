@@ -10,6 +10,8 @@ use crate::util::permit_alloc;
 pub(crate) mod buffer_management;
 #[cfg(all(debug_assertions, feature = "editor"))]
 pub(crate) mod context_checks;
+// DELTON FORK DELTA
+pub(crate) mod raw_automation;
 
 /// The bit that controls flush-to-zero behavior for denormals in 32 and 64-bit floating point
 /// numbers on x86 family architectures. Rust 1.75 deprecated the built in functions for controlling

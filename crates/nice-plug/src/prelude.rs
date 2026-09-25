@@ -21,7 +21,8 @@ pub use crate::context::PluginApi;
 pub use crate::context::activate::ActivateContext;
 #[cfg(feature = "editor")]
 pub use crate::context::gui::{AsyncExecutor, GuiContextInner, ParamSetter};
-pub use crate::context::process::{ProcessContext, Transport};
+// DELTON FORK DELTA
+pub use crate::context::process::{ParamAutomationPoint, ProcessContext, Transport};
 pub use crate::context::remote_controls::{
     RemoteControlsContext, RemoteControlsPage, RemoteControlsSection,
 };

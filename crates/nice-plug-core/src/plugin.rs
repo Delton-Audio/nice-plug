@@ -129,6 +129,25 @@ pub trait Plugin: Default + Send + 'static {
     /// Defaults to `false`
     const SAMPLE_ACCURATE_AUTOMATION: bool = false;
 
+    /// If enabled, the host's parameter automation for each process call is also handed to the
+    /// plugin as timestamped points through
+    /// [`ProcessContext::param_automation()`][crate::context::process::ProcessContext::param_automation()],
+    /// so the plugin can render the automation curve itself.
+    ///
+    /// Independent of [`SAMPLE_ACCURATE_AUTOMATION`][Self::SAMPLE_ACCURATE_AUTOMATION], and
+    /// normally used instead of it. Parameters are still updated and smoothed as usual, so
+    /// `param.value()` and the GUI stay correct whether or not the plugin reads the points.
+    // DELTON FORK DELTA: raw parameter automation (offered upstream).
+    const RAW_PARAM_AUTOMATION: bool = false;
+
+    /// The most raw automation points one process call can hold when
+    /// [`RAW_PARAM_AUTOMATION`][Self::RAW_PARAM_AUTOMATION] is enabled. Preallocated; points
+    /// beyond it are dropped and
+    /// [`ProcessContext::param_automation_overflowed()`][crate::context::process::ProcessContext::param_automation_overflowed()]
+    /// reports it.
+    // DELTON FORK DELTA
+    const RAW_PARAM_AUTOMATION_CAPACITY: usize = 4096;
+
     /// If this is set to true, then the plugin will report itself as having a hard realtime
     /// processing requirement when the host asks for it. Supported hosts will never ask the plugin
     /// to do offline processing.

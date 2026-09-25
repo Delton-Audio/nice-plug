@@ -2,6 +2,8 @@
 
 use crate::{
     midi::{MidiConfig, PluginNoteEvent},
+    // DELTON FORK DELTA
+    params::internals::ParamPtr,
     plugin::Plugin,
 };
 
@@ -17,6 +19,27 @@ use super::PluginApi;
 // The implementing wrapper needs to be able to handle concurrent requests, and it should perform
 // the actual callback within [MainThreadQueue::schedule_gui].
 pub trait ProcessContext<P: Plugin> {
+    /// The host's parameter automation for this process call, as points sorted by `timing`
+    /// (stable: points with equal timing keep the host's order). Empty unless
+    /// [`Plugin::RAW_PARAM_AUTOMATION`] is set, and always empty in the standalone wrapper.
+    ///
+    /// `timing` is relative to the buffer passed to this `process()` call. Whenever the wrapper
+    /// splits a host buffer into several `process()` calls ([`Plugin::SAMPLE_ACCURATE_AUTOMATION`],
+    /// or a transport change in the middle of a CLAP buffer), each call sees only the points that
+    /// fall inside its sub-buffer, rebased to it.
+    // DELTON FORK DELTA
+    fn param_automation(&self) -> &[ParamAutomationPoint] {
+        &[]
+    }
+
+    /// Whether this process call had more points than
+    /// [`Plugin::RAW_PARAM_AUTOMATION_CAPACITY`]; the excess was dropped (the parameters
+    /// themselves were still updated).
+    // DELTON FORK DELTA
+    fn param_automation_overflowed(&self) -> bool {
+        false
+    }
+
     /// Get the current plugin API.
     fn plugin_api(&self) -> PluginApi;
 
@@ -103,6 +126,19 @@ pub trait ProcessContext<P: Plugin> {
     //       change to a queue (or directly to the VST3 plugin's parameter output queues) instead of
     //       using main thread host automation (and all the locks involved there).
     // fn set_parameter<P: Param>(&self, param: &P, value: P::Plain);
+}
+
+/// One host parameter automation point within the current process call.
+/// See [`ProcessContext::param_automation()`].
+// DELTON FORK DELTA
+#[derive(Debug, Clone, Copy)]
+pub struct ParamAutomationPoint {
+    /// Sample offset within the current buffer.
+    pub timing: u32,
+    /// The parameter this point targets.
+    pub param: ParamPtr,
+    /// The normalized value (0..=1) at that offset.
+    pub normalized_value: f32,
 }
 
 /// An error occurred while sending an event with [`ProcessContext::try_send_event()`].

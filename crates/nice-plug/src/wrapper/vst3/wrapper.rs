@@ -1,6 +1,7 @@
 use atomic_refcell::AtomicRefMut;
 use nice_plug_core::audio_setup::{AuxiliaryBuffers, BufferConfig, ProcessMode};
-use nice_plug_core::context::process::Transport;
+// DELTON FORK DELTA
+use nice_plug_core::context::process::{ParamAutomationPoint, Transport};
 #[cfg(feature = "editor")]
 use nice_plug_core::editor::Editor;
 use nice_plug_core::midi::{Channel, Key, MidiConfig, NoteEvent, VoiceID};
@@ -1103,6 +1104,10 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
             // can treat it as a sort of queue.
             let mut process_events = self.inner.process_events.borrow_mut();
             process_events.clear();
+            // DELTON FORK DELTA
+            if P::RAW_PARAM_AUTOMATION {
+                self.inner.raw_automation.borrow_mut().clear();
+            }
 
             let push_process_event = |process_events: &mut AtomicRefMut<Vec<ProcessEvent<P>>>,
                                       event: ProcessEvent<P>| {
@@ -1206,26 +1211,46 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                             },
                                         }),
                                     );
-                                } else if P::SAMPLE_ACCURATE_AUTOMATION {
-                                    push_process_event(
-                                        &mut process_events,
-                                        ProcessEvent::ParameterChange {
-                                            timing,
-                                            hash: param_hash,
-                                            normalized_value: value,
-                                        },
-                                    );
                                 } else {
-                                    self.inner.set_normalized_value_by_hash(
-                                        param_hash,
-                                        value,
-                                        Some(sample_rate),
-                                    );
+                                    // DELTON FORK DELTA
+                                    if P::RAW_PARAM_AUTOMATION
+                                        && let Some(&ptr) =
+                                            self.inner.param_by_hash.get(&param_hash)
+                                    {
+                                        self.inner.raw_automation.borrow_mut().push(
+                                            ParamAutomationPoint {
+                                                timing,
+                                                param: ptr,
+                                                normalized_value: value,
+                                            },
+                                        );
+                                    }
+                                    if P::SAMPLE_ACCURATE_AUTOMATION {
+                                        push_process_event(
+                                            &mut process_events,
+                                            ProcessEvent::ParameterChange {
+                                                timing,
+                                                hash: param_hash,
+                                                normalized_value: value,
+                                            },
+                                        );
+                                    } else {
+                                        self.inner.set_normalized_value_by_hash(
+                                            param_hash,
+                                            value,
+                                            Some(sample_rate),
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            }
+
+            // DELTON FORK DELTA
+            if P::RAW_PARAM_AUTOMATION {
+                self.inner.raw_automation.borrow_mut().sort_by_timing();
             }
 
             // Then we'll add all of our input events
@@ -1406,6 +1431,18 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                             }
                         }
                     }
+                }
+
+                // DELTON FORK DELTA
+                if P::RAW_PARAM_AUTOMATION && P::SAMPLE_ACCURATE_AUTOMATION && !is_param_flush {
+                    self.inner
+                        .raw_automation_window
+                        .borrow_mut()
+                        .fill_rebased_window(
+                            &self.inner.raw_automation.borrow(),
+                            block_start as u32,
+                            block_end as u32,
+                        );
                 }
 
                 let result = if is_param_flush {

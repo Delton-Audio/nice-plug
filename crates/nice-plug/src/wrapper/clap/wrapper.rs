@@ -69,7 +69,8 @@ use crossbeam::queue::ArrayQueue;
 use nice_plug_core::audio_setup::{AudioIOLayout, AuxiliaryBuffers, BufferConfig, ProcessMode};
 #[cfg(feature = "editor")]
 use nice_plug_core::context::gui::GuiContext;
-use nice_plug_core::context::process::Transport;
+// DELTON FORK DELTA
+use nice_plug_core::context::process::{ParamAutomationPoint, Transport};
 #[cfg(feature = "editor")]
 use nice_plug_core::editor::{Editor, SpawnedEditor};
 use nice_plug_core::midi::{Channel, Key, MidiConfig, NoteEvent, PluginNoteEvent, VoiceID};
@@ -105,6 +106,8 @@ use crate::wrapper::clap::context::WrapperGuiContext;
 use crate::wrapper::clap::util::{read_stream, write_stream};
 use crate::wrapper::state::{self};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
+// DELTON FORK DELTA
+use crate::wrapper::util::raw_automation::{RawAutomation, clap_value_to_normalized};
 use crate::wrapper::util::{clamp_input_event_timing, hash_param_id, process_wrapper, strlcpy};
 
 /// How many output parameter changes we can store in our output parameter change queue. Storing
@@ -162,6 +165,8 @@ pub struct Wrapper<P: ClapPlugin> {
     /// TODO: Maybe load these lazily at some point instead of needing to spool them all to this
     ///       queue first
     input_events: AtomicRefCell<VecDeque<PluginNoteEvent<P>>>,
+    // DELTON FORK DELTA
+    raw_automation: AtomicRefCell<RawAutomation>,
     /// The last process status returned by the plugin. This is used for tail handling.
     last_process_status: AtomicCell<ProcessStatus>,
     /// Whether the latency has changed since the last call to `activate`. When this is set,
@@ -614,6 +619,12 @@ impl<P: ClapPlugin> Wrapper<P> {
             current_buffer_config: AtomicCell::new(None),
             current_process_mode: AtomicCell::new(ProcessMode::Realtime),
             input_events: AtomicRefCell::new(VecDeque::with_capacity(P::INPUT_EVENT_CAPACITY)),
+            // DELTON FORK DELTA
+            raw_automation: AtomicRefCell::new(RawAutomation::new(if P::RAW_PARAM_AUTOMATION {
+                P::RAW_PARAM_AUTOMATION_CAPACITY
+            } else {
+                0
+            })),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
             latency_changed: AtomicBool::new(false),
             current_latency: AtomicU32::new(0),
@@ -850,6 +861,8 @@ impl<P: ClapPlugin> Wrapper<P> {
         WrapperProcessContext {
             wrapper: self,
             input_events_guard: self.input_events.borrow_mut(),
+            // DELTON FORK DELTA
+            raw_automation_guard: self.raw_automation.borrow(),
             transport,
             total_buffer_len: total_buffer_len as u32,
             current_sample_idx: current_sample_idx as u32,
@@ -911,8 +924,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                             return false;
                         }
 
-                        let normalized_value = clap_plain_value as f32
-                            / unsafe { param_ptr.step_count() }.unwrap_or(1) as f32;
+                        // DELTON FORK DELTA
+                        let normalized_value = clap_value_to_normalized(clap_plain_value, unsafe {
+                            param_ptr.step_count()
+                        });
 
                         if unsafe { param_ptr._internal_set_normalized_value(normalized_value) } {
                             if let Some(sample_rate) = sample_rate {
@@ -983,6 +998,10 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) {
         let mut input_events = self.input_events.borrow_mut();
         input_events.clear();
+        // DELTON FORK DELTA
+        if P::RAW_PARAM_AUTOMATION {
+            self.raw_automation.borrow_mut().clear();
+        }
 
         unsafe {
             let num_events = clap_call! { in_=>size(in_) };
@@ -996,6 +1015,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                     total_buffer_len,
                 );
             }
+        }
+        // DELTON FORK DELTA
+        if P::RAW_PARAM_AUTOMATION {
+            self.raw_automation.borrow_mut().sort_by_timing();
         }
     }
 
@@ -1024,12 +1047,20 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) -> Option<(usize, usize)> {
         let mut input_events = self.input_events.borrow_mut();
         input_events.clear();
+        // DELTON FORK DELTA
+        if P::RAW_PARAM_AUTOMATION {
+            self.raw_automation.borrow_mut().clear();
+        }
 
         let num_events = unsafe {
             clap_call! { in_=>size(in_) }
         };
 
         if resume_from_event_idx as u32 >= num_events {
+            // DELTON FORK DELTA
+            if P::RAW_PARAM_AUTOMATION {
+                self.raw_automation.borrow_mut().sort_by_timing();
+            }
             return None;
         }
 
@@ -1043,6 +1074,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                 // Check the current event before applying it, including the first event in the
                 // buffer. A later event belongs to the next process slice.
                 if (*event).time > current_sample_idx as u32 && stop_predicate(event) {
+                    // DELTON FORK DELTA
+                    if P::RAW_PARAM_AUTOMATION {
+                        self.raw_automation.borrow_mut().sort_by_timing();
+                    }
                     return Some(((*event).time as usize, event_idx as usize));
                 }
 
@@ -1056,6 +1091,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
         }
 
+        // DELTON FORK DELTA
+        if P::RAW_PARAM_AUTOMATION {
+            self.raw_automation.borrow_mut().sort_by_timing();
+        }
         None
     }
 
@@ -1212,6 +1251,18 @@ impl<P: ClapPlugin> Wrapper<P> {
         match (raw_event.space_id, raw_event.type_) {
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE) => {
                 let event = unsafe { &*(event as *const clap_event_param_value) };
+                // DELTON FORK DELTA
+                if P::RAW_PARAM_AUTOMATION
+                    && let Some(&ptr) = self.param_by_hash.get(&event.param_id)
+                {
+                    self.raw_automation.borrow_mut().push(ParamAutomationPoint {
+                        timing,
+                        param: ptr,
+                        normalized_value: clap_value_to_normalized(event.value, unsafe {
+                            ptr.step_count()
+                        }),
+                    });
+                }
                 self.update_plain_value_by_hash(
                     event.param_id,
                     ClapParamUpdate::PlainValueSet(event.value),
@@ -2002,6 +2053,9 @@ impl<P: ClapPlugin> Wrapper<P> {
                         }
                         None => block_end = total_buffer_len,
                     }
+                // DELTON FORK DELTA: a null event queue must not expose the previous call's points.
+                } else if P::RAW_PARAM_AUTOMATION {
+                    wrapper.raw_automation.borrow_mut().clear();
                 }
 
                 // After processing the events we now know where/if the block should be split, and

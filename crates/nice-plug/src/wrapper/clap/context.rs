@@ -1,11 +1,15 @@
-use atomic_refcell::AtomicRefMut;
+// DELTON FORK DELTA
+use atomic_refcell::{AtomicRef, AtomicRefMut};
 use clap_sys::events::clap_output_events;
 use clap_sys::ext::remote_controls::{CLAP_REMOTE_CONTROLS_COUNT, clap_remote_controls_page};
 use clap_sys::id::{CLAP_INVALID_ID, clap_id};
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use nice_plug_core::context::PluginApi;
 use nice_plug_core::context::activate::ActivateContext;
-use nice_plug_core::context::process::{ProcessContext, SendEventError, Transport};
+// DELTON FORK DELTA
+use nice_plug_core::context::process::{
+    ParamAutomationPoint, ProcessContext, SendEventError, Transport,
+};
 use nice_plug_core::context::remote_controls::{
     RemoteControlsContext, RemoteControlsPage, RemoteControlsSection,
 };
@@ -22,6 +26,8 @@ use super::wrapper::{Task, Wrapper};
 use crate::event_loop::EventLoop;
 use crate::wrapper::clap::ClapPlugin;
 use crate::wrapper::util::{clamp_output_event_timing, strlcpy};
+// DELTON FORK DELTA
+use crate::wrapper::util::raw_automation::RawAutomation;
 
 /// An [`ActivateContext`] implementation for the wrapper.
 ///
@@ -48,6 +54,8 @@ pub(crate) struct PendingActivateContextRequests {
 pub(crate) struct WrapperProcessContext<'a, P: ClapPlugin> {
     pub(super) wrapper: &'a Wrapper<P>,
     pub(super) input_events_guard: AtomicRefMut<'a, VecDeque<PluginNoteEvent<P>>>,
+    // DELTON FORK DELTA
+    pub(super) raw_automation_guard: AtomicRef<'a, RawAutomation>,
     //pub(super) output_events_guard: AtomicRefMut<'a, VecDeque<PluginNoteEvent<P>>>,
     pub(super) transport: Transport,
     // used to clamp out of bounds events to the buffer's length.
@@ -105,6 +113,16 @@ impl<P: ClapPlugin> ActivateContext<P> for WrapperActivateContext<'_, P> {
 }
 
 impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
+    // DELTON FORK DELTA
+    fn param_automation(&self) -> &[ParamAutomationPoint] {
+        self.raw_automation_guard.points()
+    }
+
+    // DELTON FORK DELTA
+    fn param_automation_overflowed(&self) -> bool {
+        self.raw_automation_guard.overflowed()
+    }
+
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Clap
     }

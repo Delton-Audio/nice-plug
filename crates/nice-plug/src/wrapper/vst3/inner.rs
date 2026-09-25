@@ -37,6 +37,8 @@ use crate::util::permit_alloc;
 use crate::wrapper::state;
 use crate::wrapper::util::buffer_management::BufferManager;
 use crate::wrapper::util::hash_param_id;
+// DELTON FORK DELTA
+use crate::wrapper::util::raw_automation::RawAutomation;
 use crate::wrapper::vst3::Vst3Plugin;
 #[cfg(feature = "editor")]
 use crate::wrapper::vst3::context::WrapperGuiContext;
@@ -140,6 +142,10 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// then do the block splitting based on that. Note events need to have their timing adjusted to
     /// match the block start, since they're all read upfront.
     pub process_events: AtomicRefCell<Vec<ProcessEvent<P>>>,
+    // DELTON FORK DELTA
+    pub raw_automation: AtomicRefCell<RawAutomation>,
+    // DELTON FORK DELTA
+    pub raw_automation_window: AtomicRefCell<RawAutomation>,
     /// The plugin is able to restore state through a method on the `GuiContext`. To avoid changing
     /// parameters mid-processing and running into garbled data if the host also tries to load state
     /// at the same time the restoring happens at the end of each processing call. If this zero
@@ -371,6 +377,20 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             input_note_events,
             note_expression_controller: AtomicRefCell::new(NoteExpressionController::default()),
             process_events: AtomicRefCell::new(Vec::with_capacity(P::INPUT_EVENT_CAPACITY)),
+            // DELTON FORK DELTA
+            raw_automation: AtomicRefCell::new(RawAutomation::new(if P::RAW_PARAM_AUTOMATION {
+                P::RAW_PARAM_AUTOMATION_CAPACITY
+            } else {
+                0
+            })),
+            // DELTON FORK DELTA
+            raw_automation_window: AtomicRefCell::new(RawAutomation::new(
+                if P::RAW_PARAM_AUTOMATION {
+                    P::RAW_PARAM_AUTOMATION_CAPACITY
+                } else {
+                    0
+                },
+            )),
             updated_state_sender,
             updated_state_receiver,
 
@@ -464,6 +484,12 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         WrapperProcessContext {
             inner: self,
             input_events_guard: self.input_note_events.borrow_mut(),
+            // DELTON FORK DELTA
+            raw_automation_guard: if P::SAMPLE_ACCURATE_AUTOMATION {
+                self.raw_automation_window.borrow()
+            } else {
+                self.raw_automation.borrow()
+            },
             transport,
             host_out_events,
             total_buffer_len: total_buffer_len as u32,

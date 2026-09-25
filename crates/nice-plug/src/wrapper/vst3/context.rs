@@ -1,9 +1,11 @@
-use atomic_refcell::AtomicRefMut;
+// DELTON FORK DELTA
+use atomic_refcell::{AtomicRef, AtomicRefMut};
 use nice_plug_core::{
     context::{
         PluginApi,
         activate::ActivateContext,
-        process::{ProcessContext, SendEventError, Transport},
+        // DELTON FORK DELTA
+        process::{ParamAutomationPoint, ProcessContext, SendEventError, Transport},
     },
     midi::{Channel, Key, MidiConfig, NoteEvent, PluginNoteEvent},
 };
@@ -29,6 +31,8 @@ use nice_plug_core::{
 };
 
 use crate::wrapper::vst3::Vst3Plugin;
+// DELTON FORK DELTA
+use crate::wrapper::util::raw_automation::RawAutomation;
 use crate::wrapper::{
     util::clamp_output_event_timing, vst3::note_expressions::NoteExpressionController,
 };
@@ -63,6 +67,8 @@ pub(crate) struct PendingActivateContextRequests {
 pub(crate) struct WrapperProcessContext<'a, P: Vst3Plugin> {
     pub(super) inner: &'a WrapperInner<P>,
     pub(super) input_events_guard: AtomicRefMut<'a, VecDeque<PluginNoteEvent<P>>>,
+    // DELTON FORK DELTA
+    pub(super) raw_automation_guard: AtomicRef<'a, RawAutomation>,
     pub(super) transport: Transport,
     pub(super) host_out_events: Option<ComRef<'a, IEventList>>,
     // used to clamp out of bounds events to the buffer's length.
@@ -109,6 +115,16 @@ impl<P: Vst3Plugin> ActivateContext<P> for WrapperActivateContext<'_, P> {
 }
 
 impl<P: Vst3Plugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
+    // DELTON FORK DELTA
+    fn param_automation(&self) -> &[ParamAutomationPoint] {
+        self.raw_automation_guard.points()
+    }
+
+    // DELTON FORK DELTA
+    fn param_automation_overflowed(&self) -> bool {
+        self.raw_automation_guard.overflowed()
+    }
+
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Vst3
     }
