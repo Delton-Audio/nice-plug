@@ -160,7 +160,10 @@ macro_rules! nice_export_clap {
                 true
             }
 
-            pub extern "C" fn deinit() {}
+            // DELTON FORK DELTA
+            pub extern "C" fn deinit() {
+                $crate::wrapper::run_module_deinit_hooks();
+            }
 
             pub extern "C" fn get_factory(factory_id: *const c_char) -> *const c_void {
                 if !factory_id.is_null() && unsafe { CStr::from_ptr(factory_id) } == CLAP_PLUGIN_FACTORY_ID {
