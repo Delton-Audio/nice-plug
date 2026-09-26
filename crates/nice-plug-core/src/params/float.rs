@@ -316,8 +316,6 @@ impl FloatParam {
                 SmoothingStyle::Logarithmic(_),
                 FloatRange::Linear { min, max }
                 | FloatRange::Skewed { min, max, .. }
-                // DELTON FORK DELTA
-                | FloatRange::Logarithmic { min, max }
                 | FloatRange::SymmetricalSkewed { min, max, .. },
             ) => *min == 0.0 || *max == 0.0 || min.signum() != max.signum(),
             _ => false,

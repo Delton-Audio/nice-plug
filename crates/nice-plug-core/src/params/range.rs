@@ -13,11 +13,6 @@ pub enum FloatRange {
     /// positive values skew the range towards the end while negative values skew the range toward
     /// the start.
     Skewed { min: f32, max: f32, factor: f32 },
-    /// A logarithmic range: `min * (max / min)^normalized`, so equal steps in the normalized
-    /// value are equal ratios in the plain value. Suited to frequencies and times. Both `min` and
-    /// `max` must be greater than zero.
-    // DELTON FORK DELTA: exact logarithmic mapping (offered upstream).
-    Logarithmic { min: f32, max: f32 },
     /// The same as [`FloatRange::Skewed`], but with the skewing happening from a central point.
     /// This central point is rescaled to be at 50% of the parameter's range for convenience of use.
     /// Git blame this comment to find a version that doesn't do this.
@@ -82,10 +77,6 @@ impl FloatRange {
             FloatRange::Skewed { min, max, factor } => {
                 ((plain.clamp(*min, *max) - min) / (max - min)).powf(*factor)
             }
-            FloatRange::Logarithmic { min, max } => {
-                // Clamp before taking the logarithm to avoid invalid values outside this range.
-                (plain.clamp(*min, *max) / min).ln() / (max / min).ln()
-            }
             FloatRange::SymmetricalSkewed {
                 min,
                 max,
@@ -122,7 +113,6 @@ impl FloatRange {
         let normalized = normalized.clamp(0.0, 1.0);
         match self {
             FloatRange::Linear { min, max } => (normalized * (max - min)) + min,
-            FloatRange::Logarithmic { min, max } => min * (max / min).powf(normalized),
             FloatRange::Skewed { min, max, factor } => {
                 (normalized.powf(factor.recip()) * (max - min)) + min
             }
@@ -159,7 +149,6 @@ impl FloatRange {
         match self {
             FloatRange::Linear { min, max }
             | FloatRange::Skewed { min, max, .. }
-            | FloatRange::Logarithmic { min, max }
             | FloatRange::SymmetricalSkewed { min, max, .. } => {
                 let normalized_naive_step_size = if finer { 0.005 } else { 0.02 };
                 let naive_step =
@@ -186,7 +175,6 @@ impl FloatRange {
         match self {
             FloatRange::Linear { min, max }
             | FloatRange::Skewed { min, max, .. }
-            | FloatRange::Logarithmic { min, max }
             | FloatRange::SymmetricalSkewed { min, max, .. } => {
                 let normalized_naive_step_size = if finer { 0.005 } else { 0.02 };
                 let naive_step =
@@ -210,7 +198,6 @@ impl FloatRange {
         match self {
             FloatRange::Linear { min, max }
             | FloatRange::Skewed { min, max, .. }
-            | FloatRange::Logarithmic { min, max }
             | FloatRange::SymmetricalSkewed { min, max, .. } => {
                 ((value / step_size).round() * step_size).clamp(*min, *max)
             }
@@ -224,7 +211,6 @@ impl FloatRange {
         match self {
             FloatRange::Linear { min, max }
             | FloatRange::Skewed { min, max, .. }
-            | FloatRange::Logarithmic { min, max }
             | FloatRange::SymmetricalSkewed { min, max, .. } => {
                 nice_debug_assert!(
                     min < max,
@@ -233,9 +219,6 @@ impl FloatRange {
                     min,
                     max
                 );
-                if let FloatRange::Logarithmic { min, .. } = self {
-                    nice_debug_assert!(*min > 0.0, "Logarithmic ranges need a positive minimum");
-                }
             }
             FloatRange::Reversed(range) => range.assert_validity(),
         }
@@ -504,78 +487,6 @@ mod tests {
                 linear_range.unnormalize(0.25),
                 skewed_range.unnormalize(0.25)
             );
-        }
-    }
-
-    // DELTON FORK DELTA
-    mod logarithmic {
-        use super::*;
-
-        const fn make_logarithmic_range() -> FloatRange {
-            FloatRange::Logarithmic {
-                min: 20.0,
-                max: 20000.0,
-            }
-        }
-
-        #[test]
-        fn normalize_endpoints() {
-            let range = make_logarithmic_range();
-            assert!((range.normalize(20.0) - 0.0).abs() < 1e-6);
-            assert!((range.normalize(20000.0) - 1.0).abs() < 1e-6);
-        }
-
-        #[test]
-        fn geometric_mean_is_the_midpoint() {
-            let range = make_logarithmic_range();
-            assert!((range.normalize(632.455_5) - 0.5).abs() < 1e-5);
-            assert!((range.unnormalize(0.5) - 632.455_5).abs() < 0.01);
-        }
-
-        #[test]
-        fn one_decade_is_one_third() {
-            let range = make_logarithmic_range();
-            assert!((range.normalize(200.0) - 1.0 / 3.0).abs() < 1e-5);
-            assert!((range.normalize(2000.0) - 2.0 / 3.0).abs() < 1e-5);
-        }
-
-        #[test]
-        fn round_trip_grid() {
-            let range = make_logarithmic_range();
-            for i in 0..=100 {
-                let normalized = i as f32 / 100.0;
-                assert!((range.normalize(range.unnormalize(normalized)) - normalized).abs() < 1e-5);
-            }
-        }
-
-        #[test]
-        fn clamps_before_the_log() {
-            let range = make_logarithmic_range();
-            for value in [0.0, -5.0, 1.0e9] {
-                assert!(range.normalize(value).is_finite());
-            }
-            assert_eq!(range.normalize(0.0), 0.0);
-            assert_eq!(range.normalize(-5.0), 0.0);
-            assert_eq!(range.normalize(1.0e9), 1.0);
-        }
-
-        #[test]
-        fn reversed_logarithmic() {
-            static WRAPPED_RANGE: FloatRange = make_logarithmic_range();
-            let range = FloatRange::Reversed(&WRAPPED_RANGE);
-            assert!((range.normalize(20.0) - 1.0).abs() < 1e-6);
-            assert!((range.normalize(20000.0) - 0.0).abs() < 1e-6);
-            assert!((range.normalize(200.0) - 2.0 / 3.0).abs() < 1e-5);
-        }
-
-        #[test]
-        fn steps_move_by_ratio() {
-            let range = make_logarithmic_range();
-            let next = range.next_step(1000.0, None, false);
-            let previous = range.previous_step(1000.0, None, false);
-            assert!(next > 1000.0);
-            assert!(previous < 1000.0);
-            assert!((next / 1000.0 - 1000.0 / previous).abs() < 1e-3);
         }
     }
 }
