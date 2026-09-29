@@ -207,8 +207,13 @@ impl BufferManager {
                         }
 
                         // If the caller/host should have provided buffer pointers but didn't then we
-                        // must get rid of any dangling slices
-                        output_slices[output_channel_pointers.num_channels..].fill_with(|| &mut [])
+                        // must get rid of any dangling slices. DELTON FORK DELTA: capped at the
+                        // slots that exist; a host passing more channels than the layout (or any
+                        // channels before activation, when there are no slots) must not panic.
+                        let first_unused = output_channel_pointers
+                            .num_channels
+                            .min(output_slices.len());
+                        output_slices[first_unused..].fill_with(|| &mut [])
                     }
                     None => {
                         crate::nice_debug_assert_eq!(output_slices.len(), 0);
@@ -366,9 +371,12 @@ impl BufferManager {
                             }
 
                             // If the caller/host should have provided buffer pointers but didn't then
-                            // we must get rid of any dangling slices
-                            output_slices[output_channel_pointers.num_channels..]
-                                .fill_with(|| &mut [])
+                            // we must get rid of any dangling slices. DELTON FORK DELTA: capped, as
+                            // for the main output above.
+                            let first_unused = output_channel_pointers
+                                .num_channels
+                                .min(output_slices.len());
+                            output_slices[first_unused..].fill_with(|| &mut [])
                         }
                         None => {
                             crate::nice_debug_assert_eq!(output_slices.len(), 0);

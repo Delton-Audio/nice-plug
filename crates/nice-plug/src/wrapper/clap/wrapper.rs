@@ -1976,6 +1976,15 @@ impl<P: ClapPlugin> Wrapper<P> {
         );
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
 
+        // DELTON FORK DELTA: a host may call `process()` before `activate()` (FL Studio's Patcher
+        // does, when a plugin is dropped into an already wired chain). Nothing is prepared then:
+        // the buffer manager has no slots for the host's channels. Refuse the block, and hand the
+        // host silence rather than whatever its output buffers held.
+        if !wrapper.is_activated.load(Ordering::SeqCst) {
+            unsafe { silence_outputs(&*process) };
+            return CLAP_PROCESS_ERROR;
+        }
+
         // Panic on allocations if the `assert_process_allocs` feature has been enabled, and make
         // sure that FTZ is set up correctly
         process_wrapper(|| {
@@ -3589,6 +3598,32 @@ impl<P: ClapPlugin> Wrapper<P> {
 /// # Safety
 ///
 /// The extension type `T` must match the extension's name `name`.
+/// DELTON FORK DELTA: zeroes every output channel the host passed, for a block the plugin
+/// refuses. Null buffer and channel pointers are skipped; `frames_count` bounds every write.
+unsafe fn silence_outputs(process: &clap_process) {
+    if process.audio_outputs.is_null() {
+        return;
+    }
+    let frames = process.frames_count as usize;
+    for port in 0..process.audio_outputs_count as usize {
+        let buffer = unsafe { &*process.audio_outputs.add(port) };
+        for channel in 0..buffer.channel_count as usize {
+            if !buffer.data32.is_null() {
+                let samples = unsafe { *buffer.data32.add(channel) };
+                if !samples.is_null() {
+                    unsafe { std::slice::from_raw_parts_mut(samples, frames) }.fill(0.0);
+                }
+            }
+            if !buffer.data64.is_null() {
+                let samples = unsafe { *buffer.data64.add(channel) };
+                if !samples.is_null() {
+                    unsafe { std::slice::from_raw_parts_mut(samples, frames) }.fill(0.0);
+                }
+            }
+        }
+    }
+}
+
 unsafe fn query_host_extension<T>(
     host_callback: &ClapPtr<clap_host>,
     name: &CStr,
