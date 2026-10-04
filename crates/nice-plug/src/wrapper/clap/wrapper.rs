@@ -2206,7 +2206,13 @@ impl<P: ClapPlugin> Wrapper<P> {
                     transport.preroll_active =
                         Some(context.flags & CLAP_TRANSPORT_IS_WITHIN_PRE_ROLL != 0);
                     if context.flags & CLAP_TRANSPORT_HAS_TEMPO != 0 {
-                        transport.tempo = Some(context.tempo);
+                        transport.tempo_inc = Some(context.tempo_inc);
+                        if P::SAMPLE_ACCURATE_AUTOMATION && block_start > 0 {
+                            transport.tempo =
+                                Some(context.tempo + context.tempo_inc * block_start as f64);
+                        } else {
+                            transport.tempo = Some(context.tempo);
+                        }
                     }
                     if context.flags & CLAP_TRANSPORT_HAS_TIME_SIGNATURE != 0 {
                         transport.time_sig_numerator = Some(context.tsig_num as i32);
@@ -2222,10 +2228,12 @@ impl<P: ClapPlugin> Wrapper<P> {
                             && block_start > 0
                             && (context.flags & CLAP_TRANSPORT_HAS_TEMPO != 0)
                         {
+                            // The beat offset integrates the tempo ramp over the skipped samples
+                            let n = block_start as f64;
                             transport.pos_beats = Some(
                                 beats
-                                    + (block_start as f64 / sample_rate as f64 / 60.0
-                                        * context.tempo),
+                                    + (context.tempo * n + context.tempo_inc * n * n / 2.0)
+                                        / (60.0 * sample_rate as f64),
                             );
                         } else {
                             transport.pos_beats = Some(beats);

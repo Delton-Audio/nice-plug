@@ -174,6 +174,9 @@ pub struct Transport {
     pub sample_rate: f32,
     /// The project's tempo in beats per minute.
     pub tempo: Option<f64>,
+    /// The tempo's linear change in beats per minute per sample within this process call, if the
+    /// plugin API reports it (CLAP's `tempo_inc`). `None` when unknown.
+    pub tempo_inc: Option<f64>,
     /// The time signature's numerator.
     pub time_sig_numerator: Option<i32>,
     /// The time signature's denominator.
@@ -221,6 +224,7 @@ impl Transport {
 
             sample_rate,
             tempo: None,
+            tempo_inc: None,
             time_sig_numerator: None,
             time_sig_denominator: None,
 
