@@ -65,7 +65,8 @@ const fn swap_vst3_uid_byte_order(mut uid: [u8; 16]) -> [u8; 16] {
 /// plugin's vendor information is used for the factory's information.
 #[macro_export]
 macro_rules! nice_export_vst3 {
-    ($($plugin_ty:ty),+) => {
+    // DELTON FORK DELTA: CPU gate (Delton PACKAGING_DESIGN 3.3)
+    (@unexported $($plugin_ty:ty),+) => {
         // Earlier versions used a simple generic struct for this, but because we don't have
         // variadic generics (yet) we can't generate the struct for multiple plugin types without
         // macros. So instead we'll generate the implementation ad-hoc inside of this macro.
@@ -213,73 +214,124 @@ macro_rules! nice_export_vst3 {
             }
         }
 
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        mod vst3_entry {
+            use super::*;
+
+            /// The VST3 plugin factory entry point.
+            pub extern "system" fn GetPluginFactory() -> *mut ::std::ffi::c_void {
+                use $crate::wrapper::vst3::vst3::{ComWrapper, Steinberg::IPluginFactory};
+
+                ComWrapper::new(super::vst3::Factory::new())
+                    .to_com_ptr::<IPluginFactory>()
+                    .unwrap()
+                    .into_raw() as *mut ::std::ffi::c_void
+            }
+
+            // These two entry points are used on Linux, and they would theoretically also be used on
+            // the BSDs:
+            // https://github.com/steinbergmedia/vst3_public_sdk/blob/c3948deb407bdbff89de8fb6ab8500ea4df9d6d9/source/main/linuxmain.cpp#L47-L52
+            #[allow(missing_docs)]
+            #[cfg(all(target_family = "unix", not(target_os = "macos")))]
+            pub extern "C" fn ModuleEntry(_lib_handle: *mut ::std::ffi::c_void) -> bool {
+                $({$crate::wrapper::setup_logger::<$plugin_ty>();})+
+                true
+            }
+
+            #[allow(missing_docs)]
+            #[cfg(all(target_family = "unix", not(target_os = "macos")))]
+            pub extern "C" fn ModuleExit() -> bool {
+                // DELTON FORK DELTA
+                $crate::wrapper::run_module_deinit_hooks();
+                true
+            }
+
+            // These two entry points are used on macOS:
+            // https://github.com/steinbergmedia/vst3_public_sdk/blob/bc459feee68803346737901471441fd4829ec3f9/source/main/macmain.cpp#L60-L61
+            #[allow(missing_docs)]
+            #[cfg(target_os = "macos")]
+            pub extern "C" fn bundleEntry(_lib_handle: *mut ::std::ffi::c_void) -> bool {
+                $({$crate::wrapper::setup_logger::<$plugin_ty>();})+
+                true
+            }
+
+            #[allow(missing_docs)]
+            #[cfg(target_os = "macos")]
+            pub extern "C" fn bundleExit() -> bool {
+                // DELTON FORK DELTA
+                $crate::wrapper::run_module_deinit_hooks();
+                true
+            }
+
+            // And these two entry points are used on Windows:
+            // https://github.com/steinbergmedia/vst3_public_sdk/blob/bc459feee68803346737901471441fd4829ec3f9/source/main/dllmain.cpp#L59-L60
+            #[allow(missing_docs)]
+            #[cfg(target_os = "windows")]
+            pub extern "system" fn InitDll() -> bool {
+                $({$crate::wrapper::setup_logger::<$plugin_ty>();})+
+                true
+            }
+
+            #[allow(missing_docs)]
+            #[cfg(target_os = "windows")]
+            pub extern "system" fn ExitDll() -> bool {
+                // DELTON FORK DELTA
+                $crate::wrapper::run_module_deinit_hooks();
+                true
+            }
+        }
+    };
+    // DELTON FORK DELTA: CPU gate (Delton PACKAGING_DESIGN 3.3)
+    ($($plugin_ty:ty),+) => {
+        $crate::nice_export_vst3!(@unexported $($plugin_ty),+);
+
         /// The VST3 plugin factory entry point.
         #[unsafe(no_mangle)]
         pub extern "system" fn GetPluginFactory() -> *mut ::std::ffi::c_void {
-            use $crate::wrapper::vst3::vst3::{ComWrapper, Steinberg::IPluginFactory};
-
-            ComWrapper::new(self::vst3::Factory::new())
-                .to_com_ptr::<IPluginFactory>()
-                .unwrap()
-                .into_raw() as *mut ::std::ffi::c_void
+            self::vst3_entry::GetPluginFactory()
         }
 
-        // These two entry points are used on Linux, and they would theoretically also be used on
-        // the BSDs:
-        // https://github.com/steinbergmedia/vst3_public_sdk/blob/c3948deb407bdbff89de8fb6ab8500ea4df9d6d9/source/main/linuxmain.cpp#L47-L52
         #[allow(missing_docs)]
         #[unsafe(no_mangle)]
         #[cfg(all(target_family = "unix", not(target_os = "macos")))]
         pub extern "C" fn ModuleEntry(_lib_handle: *mut ::std::ffi::c_void) -> bool {
-            $({$crate::wrapper::setup_logger::<$plugin_ty>();})+
-            true
+            self::vst3_entry::ModuleEntry(_lib_handle)
         }
 
         #[allow(missing_docs)]
         #[unsafe(no_mangle)]
         #[cfg(all(target_family = "unix", not(target_os = "macos")))]
         pub extern "C" fn ModuleExit() -> bool {
-            // DELTON FORK DELTA
-            $crate::wrapper::run_module_deinit_hooks();
-            true
+            self::vst3_entry::ModuleExit()
         }
 
-        // These two entry points are used on macOS:
-        // https://github.com/steinbergmedia/vst3_public_sdk/blob/bc459feee68803346737901471441fd4829ec3f9/source/main/macmain.cpp#L60-L61
         #[allow(missing_docs)]
         #[unsafe(no_mangle)]
         #[cfg(target_os = "macos")]
         pub extern "C" fn bundleEntry(_lib_handle: *mut ::std::ffi::c_void) -> bool {
-            $({$crate::wrapper::setup_logger::<$plugin_ty>();})+
-            true
+            self::vst3_entry::bundleEntry(_lib_handle)
         }
 
         #[allow(missing_docs)]
         #[unsafe(no_mangle)]
         #[cfg(target_os = "macos")]
         pub extern "C" fn bundleExit() -> bool {
-            // DELTON FORK DELTA
-            $crate::wrapper::run_module_deinit_hooks();
-            true
+            self::vst3_entry::bundleExit()
         }
 
-        // And these two entry points are used on Windows:
-        // https://github.com/steinbergmedia/vst3_public_sdk/blob/bc459feee68803346737901471441fd4829ec3f9/source/main/dllmain.cpp#L59-L60
         #[allow(missing_docs)]
         #[unsafe(no_mangle)]
         #[cfg(target_os = "windows")]
         pub extern "system" fn InitDll() -> bool {
-            $({$crate::wrapper::setup_logger::<$plugin_ty>();})+
-            true
+            self::vst3_entry::InitDll()
         }
 
         #[allow(missing_docs)]
         #[unsafe(no_mangle)]
         #[cfg(target_os = "windows")]
         pub extern "system" fn ExitDll() -> bool {
-            // DELTON FORK DELTA
-            $crate::wrapper::run_module_deinit_hooks();
-            true
+            self::vst3_entry::ExitDll()
         }
     };
 }

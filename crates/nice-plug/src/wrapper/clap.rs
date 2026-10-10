@@ -60,7 +60,8 @@ pub struct PolyModulationConfig {
 /// Export one or more CLAP plugins from this library using the provided plugin types.
 #[macro_export]
 macro_rules! nice_export_clap {
-    ($($plugin_ty:ty),+) => {
+    // DELTON FORK DELTA: CPU gate (Delton PACKAGING_DESIGN 3.3)
+    (@unexported $($plugin_ty:ty),+) => {
         // Earlier versions used a simple generic struct for this, but because we don't have
         // variadic generics (yet) we can't generate the struct for multiple plugin types without
         // macros. So instead we'll generate the implementation ad-hoc inside of this macro.
@@ -173,6 +174,11 @@ macro_rules! nice_export_clap {
                 }
             }
         }
+
+    };
+    // DELTON FORK DELTA: CPU gate (Delton PACKAGING_DESIGN 3.3)
+    ($($plugin_ty:ty),+) => {
+        $crate::nice_export_clap!(@unexported $($plugin_ty),+);
 
         /// The CLAP plugin's entry point.
         #[unsafe(no_mangle)]
