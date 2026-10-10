@@ -1,6 +1,8 @@
 //! A context passed during the process function.
 
 use crate::{
+    // DELTON FORK DELTA
+    audio_setup::ProcessMode,
     midi::{MidiConfig, PluginNoteEvent},
     // DELTON FORK DELTA
     params::internals::ParamPtr,
@@ -66,6 +68,15 @@ pub trait ProcessContext<P: Plugin> {
 
     /// Get information about the current transport position and status.
     fn transport(&self) -> &Transport;
+
+    /// The host's current processing mode, read for this process call. Unlike
+    /// [`BufferConfig::process_mode`][crate::audio_setup::BufferConfig], which is fixed at
+    /// activation, this follows a CLAP render mode change made while the plugin is active (see
+    /// [`Plugin::RESTART_ON_PROCESS_MODE_CHANGE`]).
+    // DELTON FORK DELTA: render mode without a restart (offered upstream).
+    fn process_mode(&self) -> ProcessMode {
+        ProcessMode::Realtime
+    }
 
     /// Returns the next note event, if there is one. Use
     /// [`NoteEvent::timing()`][crate::midi::NoteEvent::timing()] to get the event's timing

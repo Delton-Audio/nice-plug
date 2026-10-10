@@ -155,6 +155,20 @@ pub trait Plugin: Default + Send + 'static {
     /// Defaults to `false`
     const HARD_REALTIME_ONLY: bool = false;
 
+    /// Whether a CLAP render mode change while the plugin is activated requests a restart, so the
+    /// plugin sees the new mode in [`BufferConfig::process_mode`][crate::audio_setup::BufferConfig]
+    /// on reactivation. Hosts honor the request when they see fit: FL Studio restarts the plugin
+    /// in the middle of a render (and keeps rendering while it restarts), and some hosts ignore
+    /// it, so the plugin never learns it is rendering offline.
+    ///
+    /// Set this to `false` to only record the new mode and read it every process call with
+    /// [`ProcessContext::process_mode()`][crate::context::process::ProcessContext::process_mode()].
+    /// VST3 hosts can change the mode only while the plugin is inactive, so VST3 is unaffected.
+    ///
+    /// Defaults to `true` (upstream behavior).
+    // DELTON FORK DELTA: render mode without a restart (offered upstream).
+    const RESTART_ON_PROCESS_MODE_CHANGE: bool = true;
+
     /// The allocated capacity for the process' input event buffer.
     ///
     /// This may need to be increased if your plugin has a lot of parameters or expects a lot

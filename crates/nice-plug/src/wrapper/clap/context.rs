@@ -4,6 +4,8 @@ use clap_sys::events::clap_output_events;
 use clap_sys::ext::remote_controls::{CLAP_REMOTE_CONTROLS_COUNT, clap_remote_controls_page};
 use clap_sys::id::{CLAP_INVALID_ID, clap_id};
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
+// DELTON FORK DELTA
+use nice_plug_core::audio_setup::ProcessMode;
 use nice_plug_core::context::PluginApi;
 use nice_plug_core::context::activate::ActivateContext;
 // DELTON FORK DELTA
@@ -140,6 +142,11 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
     #[inline]
     fn transport(&self) -> &Transport {
         &self.transport
+    }
+
+    // DELTON FORK DELTA: render mode without a restart
+    fn process_mode(&self) -> ProcessMode {
+        self.wrapper.current_process_mode.load()
     }
 
     fn next_event(&mut self) -> Option<PluginNoteEvent<P>> {

@@ -3446,7 +3446,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
         };
 
+        // DELTON FORK DELTA: render mode without a restart. Opted-out plugins read the new mode
+        // per process call through `ProcessContext::process_mode()`.
         if wrapper.current_process_mode.swap(mode) != mode
+            && P::RESTART_ON_PROCESS_MODE_CHANGE
             && wrapper.is_activated.load(Ordering::SeqCst)
         {
             // We may change process mode while activated. In that case, restart the audio processor

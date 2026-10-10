@@ -91,6 +91,8 @@ pub struct BufferConfig {
 
 /// The plugin's current processing mode. Exposed through [`BufferConfig::process_mode`]. The host
 /// will reactivate the plugin whenever this changes.
+// DELTON FORK DELTA: unless the plugin sets `Plugin::RESTART_ON_PROCESS_MODE_CHANGE` to false;
+// then a CLAP change arrives through `ProcessContext::process_mode()` without a reactivation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessMode {
     /// The plugin is processing audio in real time at a fixed rate.

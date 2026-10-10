@@ -1,6 +1,8 @@
 // DELTON FORK DELTA
 use atomic_refcell::{AtomicRef, AtomicRefMut};
 use nice_plug_core::{
+    // DELTON FORK DELTA
+    audio_setup::ProcessMode,
     context::{
         PluginApi,
         activate::ActivateContext,
@@ -142,6 +144,11 @@ impl<P: Vst3Plugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
     #[inline]
     fn transport(&self) -> &Transport {
         &self.transport
+    }
+
+    // DELTON FORK DELTA: render mode without a restart (VST3 changes it only while inactive)
+    fn process_mode(&self) -> ProcessMode {
+        self.inner.current_process_mode.load()
     }
 
     fn next_event(&mut self) -> Option<PluginNoteEvent<P>> {
