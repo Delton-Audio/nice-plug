@@ -3068,7 +3068,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                 true
             }
         } else {
-            false
+            // DELTON FORK DELTA: a scale set before the window exists, if the editor takes it.
+            let accepted = match wrapper.editor.borrow().as_ref() {
+                Some(editor) => editor.lock().set_scale_factor_before_spawn(scale),
+                None => false,
+            };
+            if accepted {
+                wrapper.fallback_scale_factor.store(Some(scale));
+            }
+            accepted
         }
     }
 

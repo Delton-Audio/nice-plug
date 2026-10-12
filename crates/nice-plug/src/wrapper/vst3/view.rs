@@ -806,7 +806,20 @@ impl<P: Vst3Plugin> IPlugViewContentScaleSupportTrait for WrapperView<P> {
                 kResultOk
             }
         } else {
-            kResultFalse
+            // DELTON FORK DELTA: a scale set before the window exists (the VST3 spec allows it).
+            // `getSize` must reflect it, so the editor has to agree to take it.
+            let accepted = match self.editor.upgrade() {
+                Some(editor) => editor
+                    .lock()
+                    .set_scale_factor_before_spawn(scale_factor as f64),
+                None => false,
+            };
+            if accepted {
+                self.fallback_scale_factor.store(Some(scale_factor));
+                kResultOk
+            } else {
+                kResultFalse
+            }
         }
     }
 }

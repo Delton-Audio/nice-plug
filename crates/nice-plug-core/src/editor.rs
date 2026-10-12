@@ -280,6 +280,16 @@ pub trait Editor: Send {
     /// and in logical pixels on macOS.)
     fn size(&self) -> NativeSize<u32>;
 
+    /// DELTON FORK DELTA. Called when the host sets a scale factor while no editor window exists
+    /// (VST3 may call `setContentScaleFactor` before `attached`). Return `true` when the editor
+    /// took it: its `size()` must then report the size at that scale, and the next `spawn` also
+    /// receives it as `fallback_scale_factor`. The default returns `false`, which keeps the old
+    /// behaviour (the wrapper refuses the scale). Never called on macOS.
+    fn set_scale_factor_before_spawn(&self, scale_factor: f64) -> bool {
+        let _ = scale_factor;
+        false
+    }
+
     /// Describes whether and how the host may resize this editor. The wrapper
     /// reads this to answer the host's resize-capability queries (CLAP's
     /// `gui.can_resize` / `gui.get_resize_hints`, VST3's `canResize`).
