@@ -34,6 +34,59 @@ type BundlerConfig = HashMap<String, PackageConfig>;
 #[derive(Debug, Clone, Deserialize)]
 struct PackageConfig {
     name: Option<String>,
+    // DELTON FORK DELTA: optional macOS `CFBundleIdentifier` and
+    // `CFBundleShortVersionString`/`CFBundleVersion` per package.
+    #[serde(default)]
+    bundle_identifier: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+// DELTON FORK DELTA: values a caller supplies for the macOS `Info.plist`. They take precedence over
+// the `bundler.toml` fields, which take precedence over the defaults.
+/// The macOS bundle identifier and version a caller wants written to `Info.plist`.
+#[derive(Debug, Clone, Default)]
+pub struct BundleInfo {
+    pub identifier: Option<String>,
+    pub version: Option<String>,
+}
+
+// DELTON FORK DELTA: the version the plist used to hardcode.
+const DEFAULT_BUNDLE_VERSION: &str = "1.0.0";
+
+// DELTON FORK DELTA: resolve the identifier and version: caller, then `bundler.toml`, then default.
+fn resolve_bundle_identity(
+    package: &str,
+    info: &BundleInfo,
+    config: Option<&PackageConfig>,
+) -> (String, String) {
+    let identifier = info
+        .identifier
+        .clone()
+        .or_else(|| config.and_then(|c| c.bundle_identifier.clone()))
+        .unwrap_or_else(|| format!("com.nice-plug.{package}"));
+    let version = info
+        .version
+        .clone()
+        .or_else(|| config.and_then(|c| c.version.clone()))
+        .unwrap_or_else(|| DEFAULT_BUNDLE_VERSION.to_string());
+    (identifier, version)
+}
+
+// DELTON FORK DELTA: the plist interpolates user text, so it must be XML-escaped.
+fn xml_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The target we're generating a plugin for. This can be either the native target or a cross
@@ -217,6 +270,18 @@ pub fn build(packages: &[String], args: &[String]) -> Result<()> {
 /// specified instead, then this will assume both `x86_64-apple-darwin` and `aarch64-apple-darwin`
 /// have been built and it will try to lipo those together instead.
 pub fn bundle(target_dir: &Path, package: &str, args: &[String], universal: bool) -> Result<()> {
+    bundle_with_info(target_dir, package, args, universal, &BundleInfo::default())
+}
+
+// DELTON FORK DELTA: like [`bundle()`], but the caller supplies the macOS bundle identifier and
+// version (see [`BundleInfo`]).
+pub fn bundle_with_info(
+    target_dir: &Path,
+    package: &str,
+    args: &[String],
+    universal: bool,
+    info: &BundleInfo,
+) -> Result<()> {
     let mut build_type_dir = "debug";
     let mut cross_compile_target: Option<String> = None;
     for arg_idx in (0..args.len()).rev() {
@@ -289,6 +354,7 @@ pub fn bundle(target_dir: &Path, package: &str, args: &[String], universal: bool
                 package,
                 &[&x86_64_bin_path, &aarch64_bin_path],
                 CompilationTarget::MacOSUniversal,
+                info,
             )?;
         }
         if build_lib {
@@ -297,6 +363,7 @@ pub fn bundle(target_dir: &Path, package: &str, args: &[String], universal: bool
                 package,
                 &[&x86_64_lib_path, &aarch64_lib_path],
                 CompilationTarget::MacOSUniversal,
+                info,
             )?;
         }
     } else {
@@ -321,10 +388,10 @@ to your Cargo.toml file?"#,
 
         eprintln!();
         if bin_path.exists() {
-            bundle_binary(target_dir, package, &[&bin_path], compilation_target)?;
+            bundle_binary(target_dir, package, &[&bin_path], compilation_target, info)?;
         }
         if lib_path.exists() {
-            bundle_plugin(target_dir, package, &[&lib_path], compilation_target)?;
+            bundle_plugin(target_dir, package, &[&lib_path], compilation_target, info)?;
         }
     }
 
@@ -339,12 +406,16 @@ fn bundle_binary(
     package: &str,
     bin_paths: &[&Path],
     compilation_target: CompilationTarget,
+    info: &BundleInfo,
 ) -> Result<()> {
     let bundle_home_dir = bundle_home(target_dir);
-    let bundle_name = match load_bundler_config()?.and_then(|c| c.get(package).cloned()) {
-        Some(PackageConfig { name: Some(name) }) => name,
-        _ => package.to_string(),
+    let package_config = load_bundler_config()?.and_then(|c| c.get(package).cloned());
+    let bundle_name = match package_config.as_ref().and_then(|c| c.name.clone()) {
+        Some(name) => name,
+        None => package.to_string(),
     };
+    let (bundle_identifier, bundle_version) =
+        resolve_bundle_identity(package, info, package_config.as_ref());
 
     // On MacOS the standalone target needs to be in a bundle
     let standalone_bundle_binary_name =
@@ -378,12 +449,14 @@ fn bundle_binary(
             .next()
             .expect("Malformed standalone binary path"),
     );
-    maybe_create_macos_bundle_metadata(
+    maybe_create_macos_bundle_metadata_with_info(
         package,
         &bundle_name,
         &standalone_bundle_home,
         compilation_target,
         BundleType::Binary,
+        &bundle_identifier,
+        &bundle_version,
     )?;
     maybe_codesign(&standalone_bundle_home, compilation_target);
 
@@ -403,12 +476,16 @@ fn bundle_plugin(
     package: &str,
     lib_paths: &[&Path],
     compilation_target: CompilationTarget,
+    info: &BundleInfo,
 ) -> Result<()> {
     let bundle_home_dir = bundle_home(target_dir);
-    let bundle_name = match load_bundler_config()?.and_then(|c| c.get(package).cloned()) {
-        Some(PackageConfig { name: Some(name) }) => name,
-        _ => package.to_string(),
+    let package_config = load_bundler_config()?.and_then(|c| c.get(package).cloned());
+    let bundle_name = match package_config.as_ref().and_then(|c| c.name.clone()) {
+        Some(name) => name,
+        None => package.to_string(),
     };
+    let (bundle_identifier, bundle_version) =
+        resolve_bundle_identity(package, info, package_config.as_ref());
 
     // We'll detect the plugin formats supported by the plugin binary and create bundled accordingly.
     // If `lib_path` contains paths to multiple plugins that need to be combined into a macOS
@@ -445,12 +522,14 @@ fn bundle_plugin(
                 .next()
                 .expect("Malformed CLAP library path"),
         );
-        maybe_create_macos_bundle_metadata(
+        maybe_create_macos_bundle_metadata_with_info(
             package,
             &bundle_name,
             &clap_bundle_home,
             compilation_target,
             BundleType::Plugin,
+            &bundle_identifier,
+            &bundle_version,
         )?;
         maybe_codesign(&clap_bundle_home, compilation_target);
 
@@ -473,12 +552,14 @@ fn bundle_plugin(
                 .next()
                 .expect("Malformed VST2 library path"),
         );
-        maybe_create_macos_bundle_metadata(
+        maybe_create_macos_bundle_metadata_with_info(
             package,
             &bundle_name,
             &vst2_bundle_home,
             compilation_target,
             BundleType::Plugin,
+            &bundle_identifier,
+            &bundle_version,
         )?;
         maybe_codesign(&vst2_bundle_home, compilation_target);
 
@@ -500,12 +581,14 @@ fn bundle_plugin(
             .unwrap()
             .parent()
             .unwrap();
-        maybe_create_macos_bundle_metadata(
+        maybe_create_macos_bundle_metadata_with_info(
             package,
             &bundle_name,
             vst3_bundle_home,
             compilation_target,
             BundleType::Plugin,
+            &bundle_identifier,
+            &bundle_version,
         )?;
         maybe_codesign(vst3_bundle_home, compilation_target);
 
@@ -730,13 +813,37 @@ fn vst3_bundle_library_name(package: &str, target: CompilationTarget) -> String 
 /// If compiling for macOS, create all of the bundl-y stuff Steinberg and Apple require you to have.
 ///
 /// This still requires you to move the dylib file to `{bundle_home}/Contents/macOS/{package}`
-/// yourself first.
+/// yourself first. This uses the default identifier (`com.nice-plug.{package}`) and version
+/// (`1.0.0`); see [`maybe_create_macos_bundle_metadata_with_info()`].
 pub fn maybe_create_macos_bundle_metadata(
     package: &str,
     display_name: &str,
     bundle_home: &Path,
     target: CompilationTarget,
     bundle_type: BundleType,
+) -> Result<()> {
+    // DELTON FORK DELTA: delegates with the defaults.
+    maybe_create_macos_bundle_metadata_with_info(
+        package,
+        display_name,
+        bundle_home,
+        target,
+        bundle_type,
+        &format!("com.nice-plug.{package}"),
+        DEFAULT_BUNDLE_VERSION,
+    )
+}
+
+// DELTON FORK DELTA: like [`maybe_create_macos_bundle_metadata()`] with an explicit bundle
+// identifier and version.
+pub fn maybe_create_macos_bundle_metadata_with_info(
+    _package: &str,
+    display_name: &str,
+    bundle_home: &Path,
+    target: CompilationTarget,
+    bundle_type: BundleType,
+    identifier: &str,
+    version: &str,
 ) -> Result<()> {
     if !matches!(
         target,
@@ -750,8 +857,7 @@ pub fn maybe_create_macos_bundle_metadata(
         BundleType::Binary => "APPL",
     };
 
-    // TODO: May want to add bundler.toml fields for the identifier, version and signature at some
-    //       point.
+    // TODO: May want to add a bundler.toml field for the signature at some point.
     fs::write(
         bundle_home.join("Contents").join("PkgInfo"),
         format!("{package_type}????"),
@@ -759,7 +865,100 @@ pub fn maybe_create_macos_bundle_metadata(
     .context("Could not create PkgInfo file")?;
     fs::write(
         bundle_home.join("Contents").join("Info.plist"),
-        format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+        macos_info_plist(display_name, identifier, version, bundle_type),
+    )
+    .context("Could not create Info.plist file")?;
+
+    Ok(())
+}
+
+// DELTON FORK DELTA: the `Info.plist` text as a pure function. Every interpolated value is
+// XML-escaped.
+/// The `Info.plist` text for a macOS bundle.
+pub fn macos_info_plist(
+    display_name: &str,
+    identifier: &str,
+    version: &str,
+    bundle_type: BundleType,
+) -> String {
+    let package_type = match bundle_type {
+        BundleType::Plugin => "BNDL",
+        BundleType::Binary => "APPL",
+    };
+    let display_name = xml_escape(display_name);
+    let identifier = xml_escape(identifier);
+    let version = xml_escape(version);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist>
+  <dict>
+    <key>CFBundleExecutable</key>
+    <string>{display_name}</string>
+    <key>CFBundleIconFile</key>
+    <string></string>
+    <key>CFBundleIdentifier</key>
+    <string>{identifier}</string>
+    <key>CFBundleName</key>
+    <string>{display_name}</string>
+    <key>CFBundleDisplayName</key>
+    <string>{display_name}</string>
+    <key>CFBundlePackageType</key>
+    <string>{package_type}</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleShortVersionString</key>
+    <string>{version}</string>
+    <key>CFBundleVersion</key>
+    <string>{version}</string>
+    <key>NSHumanReadableCopyright</key>
+    <string></string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+  </dict>
+</plist>
+"#
+    )
+}
+
+/// If compiling for macOS, try to self-sign the bundle at the given path. This shouldn't be
+/// necessary, but AArch64 macOS is stricter about these things and sometimes self built plugins may
+/// not load otherwise. Presumably in combination with hardened runtimes.
+///
+/// If the codesigning command could not be run then this merely prints a warning.
+pub fn maybe_codesign(bundle_home: &Path, target: CompilationTarget) {
+    if !matches!(
+        target,
+        CompilationTarget::MacOS(_) | CompilationTarget::MacOSUniversal
+    ) {
+        return;
+    }
+
+    let success = Command::new("codesign")
+        .arg("-f")
+        .arg("-s")
+        .arg("-")
+        .arg(bundle_home)
+        .status()
+        .is_ok();
+    if !success {
+        eprintln!(
+            "WARNING: Could not self-sign '{}', it may fail to run depending on the environment",
+            bundle_home.display()
+        )
+    }
+}
+
+// DELTON FORK DELTA: tests for the plist text and the identity resolution.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The text the plist had before the identifier and version became configurable.
+    fn legacy_plist(package: &str, display_name: &str, package_type: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist>
@@ -788,37 +987,70 @@ pub fn maybe_create_macos_bundle_metadata(
     <true/>
   </dict>
 </plist>
-"#),
-    )
-    .context("Could not create Info.plist file")?;
-
-    Ok(())
-}
-
-/// If compiling for macOS, try to self-sign the bundle at the given path. This shouldn't be
-/// necessary, but AArch64 macOS is stricter about these things and sometimes self built plugins may
-/// not load otherwise. Presumably in combination with hardened runtimes.
-///
-/// If the codesigning command could not be run then this merely prints a warning.
-pub fn maybe_codesign(bundle_home: &Path, target: CompilationTarget) {
-    if !matches!(
-        target,
-        CompilationTarget::MacOS(_) | CompilationTarget::MacOSUniversal
-    ) {
-        return;
+"#
+        )
     }
 
-    let success = Command::new("codesign")
-        .arg("-f")
-        .arg("-s")
-        .arg("-")
-        .arg(bundle_home)
-        .status()
-        .is_ok();
-    if !success {
-        eprintln!(
-            "WARNING: Could not self-sign '{}', it may fail to run depending on the environment",
-            bundle_home.display()
-        )
+    #[test]
+    fn defaults_reproduce_the_old_text() {
+        let (id, ver) = resolve_bundle_identity("my_plug", &BundleInfo::default(), None);
+        assert_eq!(
+            macos_info_plist("My Plug", &id, &ver, BundleType::Plugin),
+            legacy_plist("my_plug", "My Plug", "BNDL")
+        );
+        assert_eq!(
+            macos_info_plist("My Plug", &id, &ver, BundleType::Binary),
+            legacy_plist("my_plug", "My Plug", "APPL")
+        );
+    }
+
+    #[test]
+    fn supplied_values_appear() {
+        let text = macos_info_plist("P", "com.acme.p", "2.3.4", BundleType::Plugin);
+        assert!(text.contains("<string>com.acme.p</string>"));
+        assert_eq!(text.matches("<string>2.3.4</string>").count(), 2);
+        assert!(!text.contains("com.nice-plug"));
+        assert!(!text.contains("1.0.0"));
+    }
+
+    #[test]
+    fn values_are_escaped() {
+        let text = macos_info_plist("A & <B> \"C\" 'D'", "com.a&b<\"", "1", BundleType::Plugin);
+        assert!(text.contains("<string>A &amp; &lt;B&gt; &quot;C&quot; &apos;D&apos;</string>"));
+        assert!(text.contains("<string>com.a&amp;b&lt;&quot;</string>"));
+        assert!(!text.contains("A & "));
+    }
+
+    #[test]
+    fn precedence_is_caller_then_toml_then_default() {
+        let config = PackageConfig {
+            name: None,
+            bundle_identifier: Some("com.toml.id".into()),
+            version: Some("3.0.0".into()),
+        };
+        let caller = BundleInfo {
+            identifier: Some("com.caller.id".into()),
+            version: Some("4.0.0".into()),
+        };
+        assert_eq!(
+            resolve_bundle_identity("p", &caller, Some(&config)),
+            ("com.caller.id".to_string(), "4.0.0".to_string())
+        );
+        assert_eq!(
+            resolve_bundle_identity("p", &BundleInfo::default(), Some(&config)),
+            ("com.toml.id".to_string(), "3.0.0".to_string())
+        );
+        let partial = BundleInfo {
+            identifier: Some("com.caller.id".into()),
+            version: None,
+        };
+        assert_eq!(
+            resolve_bundle_identity("p", &partial, Some(&config)),
+            ("com.caller.id".to_string(), "3.0.0".to_string())
+        );
+        assert_eq!(
+            resolve_bundle_identity("p", &BundleInfo::default(), None),
+            ("com.nice-plug.p".to_string(), "1.0.0".to_string())
+        );
     }
 }
