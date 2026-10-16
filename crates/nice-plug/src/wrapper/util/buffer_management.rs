@@ -280,46 +280,15 @@ impl BufferManager {
             )
         {
             // Since these buffers are backed by our own storage, we can fill them with zeroes if
-            // the pointers are missing for whatever reason that might be
-            crate::nice_debug_assert!(input_channel_pointers.is_some());
-            match input_channel_pointers {
-                Some(input_channel_pointers) => {
-                    crate::nice_debug_assert_eq!(
-                        input_channel_pointers.num_channels,
-                        input_storage.len()
-                    );
-                    for (channel_idx, channel) in input_storage
-                        .iter_mut()
-                        .enumerate()
-                        .take(input_channel_pointers.num_channels)
-                    {
-                        let input_channel_pointer =
-                            unsafe { input_channel_pointers.ptrs.as_ptr().add(channel_idx) };
-
-                        crate::nice_debug_assert!(num_samples <= channel.capacity());
-                        channel.resize(num_samples, 0.0);
-                        channel.copy_from_slice(unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (*input_channel_pointer).add(sample_offset),
-                                num_samples,
-                            )
-                        })
-                    }
-
-                    // In case we were provided too few channels we'll fill the rest with zeroes to
-                    // avoid unexpected situations
-                    for channel in input_storage
-                        .iter_mut()
-                        .skip(input_channel_pointers.num_channels)
-                    {
-                        channel.fill(0.0);
-                    }
-                }
-                None => {
-                    for channel in input_storage.iter_mut() {
-                        channel.fill(0.0);
-                    }
-                }
+            // the pointers are missing for whatever reason that might be. DELTON FORK DELTA: a
+            // missing port is legal (an unconnected sidechain, or a VST3 host that deactivated the
+            // bus), so it is no longer a debug assertion: that logged, and logging allocates on
+            // the audio thread.
+            if let Some(input_channel_pointers) = input_channel_pointers {
+                crate::nice_debug_assert_eq!(
+                    input_channel_pointers.num_channels,
+                    input_storage.len()
+                );
             }
             unsafe {
                 input_buffer.set_slices(num_samples, |input_slices| {
@@ -327,11 +296,42 @@ impl BufferManager {
                     // should never fail unless we made an error ourselves
                     debug_assert_eq!(input_slices.len(), input_storage.len());
 
-                    for (channel_slice, channel_storage) in
-                        input_slices.iter_mut().zip(input_storage.iter_mut())
+                    for (channel_idx, (channel_slice, channel_storage)) in input_slices
+                        .iter_mut()
+                        .zip(input_storage.iter_mut())
+                        .enumerate()
                     {
-                        // SAFETY: `channel_storage` is no longer used accessed directly after this
-                        *channel_slice = &mut *(channel_storage.as_mut_slice() as *mut [f32]);
+                        // The host's samples for this channel. A channel the host did not provide
+                        // (no pointers, or fewer channels than the port declares) reads as zeroes.
+                        let host_channel = input_channel_pointers
+                            .as_ref()
+                            .filter(|pointers| channel_idx < pointers.num_channels)
+                            .map(|pointers| {
+                                let pointer = *pointers.ptrs.as_ptr().add(channel_idx);
+                                std::slice::from_raw_parts_mut(
+                                    pointer.add(sample_offset),
+                                    num_samples,
+                                )
+                            });
+
+                        // DELTON FORK DELTA: never allocate on the audio thread. The storage was
+                        // sized at activation for `max_buffer_size`; `resize` within that capacity
+                        // does not allocate, and a block longer than it (a host breaking its
+                        // contract) used to grow the storage here. Such a block is served like the
+                        // main buffers are, straight from the host's memory (no copy, no
+                        // allocation); an oversized block with nothing to read gets an empty
+                        // slice, since there is no storage to zero.
+                        if num_samples <= channel_storage.capacity() {
+                            channel_storage.resize(num_samples, 0.0);
+                            match host_channel {
+                                Some(host_channel) => channel_storage.copy_from_slice(host_channel),
+                                None => channel_storage.fill(0.0),
+                            }
+                            // SAFETY: `channel_storage` is no longer used accessed directly after this
+                            *channel_slice = &mut *(channel_storage.as_mut_slice() as *mut [f32]);
+                        } else {
+                            *channel_slice = host_channel.unwrap_or(&mut []);
+                        }
                     }
                 });
             }

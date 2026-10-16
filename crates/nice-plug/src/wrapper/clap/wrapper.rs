@@ -2135,7 +2135,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                if aux_input_idx > process.audio_inputs_count as usize {
+                                // DELTON FORK DELTA: `>=`; `>` read one input buffer past `audio_inputs_count`.
+                                if aux_input_idx >= process.audio_inputs_count as usize {
                                     break;
                                 }
 
@@ -2159,7 +2160,8 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                if aux_output_idx > process.audio_outputs_count as usize {
+                                // DELTON FORK DELTA: `>=`; `>` read one output buffer past `audio_outputs_count`.
+                                if aux_output_idx >= process.audio_outputs_count as usize {
                                     break;
                                 }
 
