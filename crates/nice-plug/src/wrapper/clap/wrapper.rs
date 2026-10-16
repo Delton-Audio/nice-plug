@@ -442,7 +442,7 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                 }
             }
             Task::LatencyChanged => match &*self.host_latency.borrow() {
-                Some(host_latency) => {
+                Some(_) => {
                     crate::nice_debug_assert!(is_gui_thread);
 
                     // The plugin needs to be deactivated in order for the latency to change. If
@@ -456,7 +456,10 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                         self.latency_changed.store(true, Ordering::SeqCst);
                         self.request_restart();
                     } else {
-                        unsafe_clap_call! { host_latency=>changed(&*self.host_callback) };
+                        // DELTON FORK DELTA: defer to the next `activate`. CLAP marks
+                        // `clap_host_latency.changed` `[main-thread & being-activated]`, so it is
+                        // illegal here, with the plugin deactivated; `activate` announces it.
+                        self.latency_changed.store(true, Ordering::SeqCst);
                     }
                 }
                 None => {
@@ -1794,14 +1797,6 @@ impl<P: ClapPlugin> Wrapper<P> {
             unsafe { param._internal_update_smoother(buffer_config.sample_rate, true) };
         }
 
-        // If this reactivation happened due to the latency changing, notify the host of that
-        // latency change.
-        if wrapper.latency_changed.swap(false, Ordering::SeqCst)
-            && let Some(host_latency) = &*wrapper.host_latency.borrow()
-        {
-            unsafe_clap_call! { host_latency=>changed(&*wrapper.host_callback) };
-        }
-
         let mut activate_context = wrapper.make_activate_context();
 
         // In the case a host misbehaves and tries to activate the plugin without waiting for the
@@ -1851,6 +1846,21 @@ impl<P: ClapPlugin> Wrapper<P> {
                 break;
             } else {
                 std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        // DELTON FORK DELTA: announce a latency change inside activate, where CLAP allows it.
+        if result {
+            let mut announce = wrapper.latency_changed.swap(false, Ordering::SeqCst);
+            if let Some(samples) = activate_context.pending_requests.latency_changed.take() {
+                if wrapper.current_latency.swap(samples, Ordering::SeqCst) != samples {
+                    announce = true;
+                }
+            }
+            if announce {
+                if let Some(host_latency) = &*wrapper.host_latency.borrow() {
+                    unsafe_clap_call! { host_latency=>changed(&*wrapper.host_callback) };
+                }
             }
         }
 

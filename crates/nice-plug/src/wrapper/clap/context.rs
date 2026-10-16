@@ -47,7 +47,7 @@ pub(crate) struct WrapperActivateContext<'a, P: ClapPlugin> {
 #[derive(Debug, Default)]
 pub(crate) struct PendingActivateContextRequests {
     /// The value of the last `.set_latency_samples()` call.
-    latency_changed: Cell<Option<u32>>,
+    pub(super) latency_changed: Cell<Option<u32>>,
 }
 
 /// A [`ProcessContext`] implementation for the wrapper. This is a separate object so it can hold on
