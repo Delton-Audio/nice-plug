@@ -137,6 +137,12 @@ pub(crate) unsafe fn set_class_info<P: AuPlugin>(
         *wrapper.present_preset_name.lock() = name.to_string();
     }
 
+    // JUCE saves through AUBase, which writes its own parameter blob under `data`, and adds
+    // `jucePluginState` beside it. Our own state never has that key, so it decides which this is.
+    if let Some(juce_state) = entry::<CFData>(&dictionary, "jucePluginState") {
+        return foreign_state_hook(&juce_state.to_vec());
+    }
+
     if let Some(data) = entry::<CFData>(&dictionary, "data") {
         if data.len() > MAX_STATE_BYTES {
             crate::nice_error!("AU: state is too large ({} bytes), ignoring it", data.len());
@@ -152,8 +158,6 @@ pub(crate) unsafe fn set_class_info<P: AuPlugin>(
             }
             None => crate::nice_error!("AU: could not parse the saved state, ignoring it"),
         }
-    } else if let Some(juce_state) = entry::<CFData>(&dictionary, "jucePluginState") {
-        return foreign_state_hook(&juce_state.to_vec());
     }
 
     NO_ERR
