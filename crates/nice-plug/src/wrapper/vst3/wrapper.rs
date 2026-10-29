@@ -467,6 +467,11 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
                     }
                 }
 
+                // DELTON FORK DELTA (STATUS 142): `process` refuses blocks until activation succeeded.
+                if result == kResultOk {
+                    self.inner.is_activated.store(true, Ordering::SeqCst);
+                }
+
                 // NOTE: This needs to be dropped after the `plugin` lock to avoid deadlocks
                 drop(activate_context);
 
@@ -474,6 +479,9 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
             }
             (true, None) => kResultFalse,
             (false, _) => {
+                // DELTON FORK DELTA (STATUS 142): stop `process` before the plugin is deactivated.
+                self.inner.is_activated.store(false, Ordering::SeqCst);
+
                 // In the case a host misbehaves and tries to activate the plugin without waiting for the
                 // `process` method to finish, manually wait for that method to finish.
                 let now = Instant::now();
@@ -1067,12 +1075,41 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         process_wrapper(|| {
             // We need to handle incoming automation first
             let data = unsafe { &*data };
-            let sample_rate = self
-                .inner
-                .current_buffer_config
-                .load()
-                .expect("Process call without prior setup call")
-                .sample_rate;
+
+            // DELTON FORK DELTA (STATUS 142): a host may process before setActive(true) (FL's
+            // Patcher does). The old expect() panicked inside an extern "system" fn, which cannot
+            // unwind, and aborted the host. Output silence and refuse the block, as the CLAP
+            // wrapper does.
+            let buffer_config = match self.inner.current_buffer_config.load() {
+                Some(buffer_config) if self.inner.is_activated.load(Ordering::SeqCst) => {
+                    buffer_config
+                }
+                _ => {
+                    if data.numSamples > 0 && !data.outputs.is_null() && data.numOutputs > 0 {
+                        for bus_idx in 0..data.numOutputs as usize {
+                            let bus = unsafe { &*data.outputs.add(bus_idx) };
+                            let channels = unsafe { bus.__field0.channelBuffers32 };
+                            if channels.is_null() {
+                                continue;
+                            }
+                            for channel_idx in 0..bus.numChannels.max(0) as usize {
+                                let samples = unsafe { *channels.add(channel_idx) };
+                                if !samples.is_null() {
+                                    unsafe {
+                                        std::slice::from_raw_parts_mut(
+                                            samples,
+                                            data.numSamples as usize,
+                                        )
+                                    }
+                                    .fill(0.0);
+                                }
+                            }
+                        }
+                    }
+                    return kResultFalse;
+                }
+            };
+            let sample_rate = buffer_config.sample_rate;
 
             crate::nice_debug_assert!(data.numInputs >= 0 && data.numOutputs >= 0);
             crate::nice_debug_assert_eq!(data.symbolicSampleSize, K_SYMBOLIC_SAMPLE_SIZE_32);
