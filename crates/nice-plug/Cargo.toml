@@ -16,7 +16,8 @@ readme = "../../README.md"
 all-features = true
 
 [features]
-default = ["editor", "vst3", "tracing-subscriber"]
+# DELTON FORK DELTA (au-1): the AUv2 wrapper (macOS only; on other targets the feature enables only the pure modules)
+default = ["editor", "vst3", "auv2", "tracing-subscriber"]
 # Enables editor (GUI) support.
 editor = ["dep:fragile", "nice-plug-core/editor"]
 # Enabling this feature will cause the plugin to terminate when allocations
@@ -42,6 +43,8 @@ standalone = [
 standalone-asio = ["standalone", "cpal/asio"]
 # Enables the `nice_export_vst3!()` macro. Enabled by default.
 vst3 = ["dep:vst3", "dep:widestring"]
+# DELTON FORK DELTA (au-1): enables the `nice_export_auv2!()` macro and the Audio Unit v2 wrapper.
+auv2 = ["dep:objc2-audio-toolbox", "dep:objc2-core-audio-types", "dep:objc2-core-foundation"]
 # Add adapters to the Buffer object for reading the channel data to and from
 # `std::simd` vectors. Requires a nightly compiler.
 simd = ["nice-plug-core/simd"]
@@ -127,6 +130,15 @@ libc = "0.2.124"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 core-foundation = "0.10.1"
+# DELTON FORK DELTA (au-1): bindings for the AUv2 wrapper (RULES D14 exception, Sam 2026-10-29)
+objc2-audio-toolbox = { version = "0.3.2", optional = true, default-features = false, features = [
+  "std", "AUComponent", "AudioComponent", "AudioUnitProperties", "AudioUnitParameters",
+  "AudioUnitUtilities", "objc2-core-audio-types", "objc2-core-foundation", "bitflags",
+] }
+objc2-core-audio-types = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CoreAudioBaseTypes", "bitflags"] }
+objc2-core-foundation = { version = "0.3.2", optional = true, default-features = false, features = [
+  "std", "CFString", "CFData", "CFDictionary", "CFNumber", "CFArray", "CFBase", "CFURL", "CFPropertyList",
+] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 workspace = true

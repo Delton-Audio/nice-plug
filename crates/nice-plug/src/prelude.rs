@@ -5,6 +5,9 @@ pub use std::num::NonZeroU32;
 pub use crate::debug::*;
 
 pub use crate::nice_export_clap;
+// DELTON FORK DELTA (au-1): cfg-gated because the macro lives in the feature-gated `auv2` module.
+#[cfg(feature = "auv2")]
+pub use crate::nice_export_auv2;
 #[cfg(feature = "vst3")]
 pub use crate::nice_export_vst3;
 #[cfg(feature = "standalone")]
@@ -44,5 +47,8 @@ pub use crate::wrapper::clap::features::ClapFeature;
 pub use crate::wrapper::clap::{ClapPlugin, PolyModulationConfig};
 #[cfg(feature = "vst3")]
 pub use crate::wrapper::vst3::Vst3Plugin;
+// DELTON FORK DELTA (au-1)
+#[cfg(feature = "auv2")]
+pub use crate::wrapper::auv2::{AuPlugin, AuType};
 #[cfg(feature = "vst3")]
 pub use crate::wrapper::vst3::subcategories::Vst3SubCategory;

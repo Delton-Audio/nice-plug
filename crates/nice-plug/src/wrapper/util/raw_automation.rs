@@ -36,6 +36,14 @@ impl RawAutomation {
         }
     }
 
+    /// Marks the list as having lost points. Used by the AUv2 wrapper when its parameter event
+    /// ring overflowed between two renders.
+    // DELTON FORK DELTA (au-1)
+    #[cfg_attr(not(all(feature = "auv2", target_os = "macos")), allow(dead_code))]
+    pub fn mark_overflowed(&mut self) {
+        self.overflowed = true;
+    }
+
     /// Stable in-place insertion sort by `timing`. No allocation.
     // DELTON FORK DELTA
     pub fn sort_by_timing(&mut self) {

@@ -18,6 +18,9 @@ pub enum PluginApi {
     Clap,
     Standalone,
     Vst3,
+    // DELTON FORK DELTA (au-1)
+    /// Audio Unit v2 (macOS).
+    Auv2,
 }
 
 impl Display for PluginApi {
@@ -26,6 +29,8 @@ impl Display for PluginApi {
             PluginApi::Clap => write!(f, "CLAP"),
             PluginApi::Standalone => write!(f, "standalone"),
             PluginApi::Vst3 => write!(f, "VST3"),
+            // DELTON FORK DELTA (au-1)
+            PluginApi::Auv2 => write!(f, "AUv2"),
         }
     }
 }

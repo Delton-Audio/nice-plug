@@ -39,6 +39,9 @@ pub fn run_module_deinit_hooks() {
 pub mod standalone;
 #[cfg(feature = "vst3")]
 pub mod vst3;
+// DELTON FORK DELTA (au-1)
+#[cfg(feature = "auv2")]
+pub mod auv2;
 
 // This is used by the wrappers.
 pub use util::setup_logger;
