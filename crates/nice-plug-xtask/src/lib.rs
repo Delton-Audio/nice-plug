@@ -40,6 +40,19 @@ struct PackageConfig {
     bundle_identifier: Option<String>,
     #[serde(default)]
     version: Option<String>,
+    // DELTON FORK DELTA (au-3): the Audio Unit identity of a `.component` bundle.
+    #[serde(default)]
+    au_type: Option<String>,
+    #[serde(default)]
+    au_subtype: Option<String>,
+    #[serde(default)]
+    au_manufacturer: Option<String>,
+    #[serde(default)]
+    au_name: Option<String>,
+    #[serde(default)]
+    au_description: Option<String>,
+    #[serde(default)]
+    au_tags: Option<Vec<String>>,
 }
 
 // DELTON FORK DELTA: values a caller supplies for the macOS `Info.plist`. They take precedence over
@@ -49,6 +62,26 @@ struct PackageConfig {
 pub struct BundleInfo {
     pub identifier: Option<String>,
     pub version: Option<String>,
+    // DELTON FORK DELTA (au-3)
+    /// The Audio Unit identity. Required when the library exports `NiceAuv2Factory`.
+    pub au: Option<AuComponentInfo>,
+}
+
+// DELTON FORK DELTA (au-3): the Audio Unit identity of a `.component` bundle.
+/// The `AudioComponents` entry a `.component` bundle's `Info.plist` declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuComponentInfo {
+    /// `aufx`, `aumf`, `aumu` or `aumi`.
+    pub au_type: String,
+    /// Four printable ASCII characters. Saved in every host project.
+    pub subtype: String,
+    /// Four printable ASCII characters, at least one of them not a lowercase letter.
+    pub manufacturer: String,
+    /// Shown by hosts. Apple's convention is "Vendor: Name".
+    pub name: String,
+    pub description: String,
+    /// Apple's category tags (`Effects`, `Delay`, ...). Empty writes no `tags` key.
+    pub tags: Vec<String>,
 }
 
 // DELTON FORK DELTA: the version the plist used to hardcode.
@@ -71,6 +104,113 @@ fn resolve_bundle_identity(
         .or_else(|| config.and_then(|c| c.version.clone()))
         .unwrap_or_else(|| DEFAULT_BUNDLE_VERSION.to_string());
     (identifier, version)
+}
+
+// DELTON FORK DELTA (au-3): moved here from the AU wrapper, where nothing else used it.
+/// `major << 16 | minor << 8 | patch` from "major.minor.patch" (the AU component version).
+/// Anything from the first '-' or '+' on is ignored. A missing part is 0. A part that does not
+/// parse as u32 makes the whole result 0. major is clamped to 0xFFFF, minor and patch to 0xFF.
+pub fn au_component_version(version: &str) -> u32 {
+    let core = version.split(['-', '+']).next().unwrap_or("");
+
+    let mut parts = [0u32; 3];
+    let mut text_parts = core.split('.');
+    for part in parts.iter_mut() {
+        match text_parts.next() {
+            Some(text) => match text.parse::<u32>() {
+                Ok(number) => *part = number,
+                Err(_) => return 0,
+            },
+            None => break,
+        }
+    }
+
+    (parts[0].min(0xFFFF) << 16) | (parts[1].min(0xFF) << 8) | parts[2].min(0xFF)
+}
+
+// DELTON FORK DELTA (au-3): why an Audio Unit identity is not valid.
+/// Why `info` is not a valid Audio Unit identity, or `None` when it is.
+fn au_component_error(info: &AuComponentInfo) -> Option<String> {
+    if !matches!(info.au_type.as_str(), "aufx" | "aumf" | "aumu" | "aumi") {
+        return Some(format!(
+            "AU type \"{}\" is not one of aufx, aumf, aumu, aumi",
+            info.au_type
+        ));
+    }
+    for (role, code) in [
+        ("subtype", &info.subtype),
+        ("manufacturer", &info.manufacturer),
+    ] {
+        if code.len() != 4 {
+            return Some(format!(
+                "AU {role} \"{code}\" must be exactly 4 characters (got {} bytes)",
+                code.len()
+            ));
+        }
+        if code.bytes().any(|byte| !(0x20..=0x7E).contains(&byte)) {
+            return Some(format!("AU {role} \"{code}\" must be printable ASCII"));
+        }
+    }
+    if info
+        .manufacturer
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase())
+    {
+        return Some(format!(
+            "AU manufacturer \"{}\" is all lowercase letters, which Apple reserves",
+            info.manufacturer
+        ));
+    }
+    None
+}
+
+// DELTON FORK DELTA (au-3): the AU identity for a bundle.
+/// The AU identity for a bundle: the caller's, else `bundler.toml`'s, else none.
+fn resolve_au_component(
+    info: &BundleInfo,
+    config: Option<&PackageConfig>,
+    bundle_name: &str,
+) -> Result<Option<AuComponentInfo>> {
+    if let Some(au) = &info.au {
+        return Ok(Some(au.clone()));
+    }
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let any_set = config.au_type.is_some()
+        || config.au_subtype.is_some()
+        || config.au_manufacturer.is_some()
+        || config.au_name.is_some()
+        || config.au_description.is_some()
+        || config.au_tags.is_some();
+    if !any_set {
+        return Ok(None);
+    }
+    let (Some(au_type), Some(subtype), Some(manufacturer)) = (
+        config.au_type.clone(),
+        config.au_subtype.clone(),
+        config.au_manufacturer.clone(),
+    ) else {
+        anyhow::bail!(
+            "bundler.toml: au_type, au_subtype and au_manufacturer go together (set all three or none)"
+        );
+    };
+    let name = config
+        .au_name
+        .clone()
+        .unwrap_or_else(|| bundle_name.to_string());
+    let description = config
+        .au_description
+        .clone()
+        .unwrap_or_else(|| name.clone());
+    Ok(Some(AuComponentInfo {
+        au_type,
+        subtype,
+        manufacturer,
+        name,
+        description,
+        tags: config.au_tags.clone().unwrap_or_default(),
+    }))
 }
 
 // DELTON FORK DELTA: the plist interpolates user text, so it must be XML-escaped.
@@ -457,6 +597,7 @@ fn bundle_binary(
         BundleType::Binary,
         &bundle_identifier,
         &bundle_version,
+        None,
     )?;
     maybe_codesign(&standalone_bundle_home, compilation_target);
 
@@ -503,7 +644,10 @@ fn bundle_plugin(
         .with_context(|| format!("Could not parse '{}'", first_lib_path.display()))?;
     let bundle_vst3 = symbols::exported(first_lib_path, "GetPluginFactory")
         .with_context(|| format!("Could not parse '{}'", first_lib_path.display()))?;
-    let bundled_plugin = bundle_clap || bundle_vst2 || bundle_vst3;
+    // DELTON FORK DELTA (au-3)
+    let bundle_au = symbols::exported(first_lib_path, "NiceAuv2Factory")
+        .with_context(|| format!("Could not parse '{}'", first_lib_path.display()))?;
+    let bundled_plugin = bundle_clap || bundle_vst2 || bundle_vst3 || bundle_au;
 
     if bundle_clap {
         let clap_bundle_library_name = clap_bundle_library_name(&bundle_name, compilation_target);
@@ -530,6 +674,7 @@ fn bundle_plugin(
             BundleType::Plugin,
             &bundle_identifier,
             &bundle_version,
+            None,
         )?;
         maybe_codesign(&clap_bundle_home, compilation_target);
 
@@ -560,6 +705,7 @@ fn bundle_plugin(
             BundleType::Plugin,
             &bundle_identifier,
             &bundle_version,
+            None,
         )?;
         maybe_codesign(&vst2_bundle_home, compilation_target);
 
@@ -589,10 +735,60 @@ fn bundle_plugin(
             BundleType::Plugin,
             &bundle_identifier,
             &bundle_version,
+            None,
         )?;
         maybe_codesign(vst3_bundle_home, compilation_target);
 
         eprintln!("Created a VST3 bundle at '{}'", vst3_bundle_home.display());
+    }
+    // DELTON FORK DELTA (au-3): an Audio Unit is a `.component` bundle, macOS only.
+    if bundle_au {
+        if !matches!(
+            compilation_target,
+            CompilationTarget::MacOS(_) | CompilationTarget::MacOSUniversal
+        ) {
+            eprintln!(
+                "WARNING: '{package}' exports NiceAuv2Factory, but Audio Units exist only on macOS; not creating an AU bundle"
+            );
+        } else {
+            let Some(au) = resolve_au_component(info, package_config.as_ref(), &bundle_name)?
+            else {
+                anyhow::bail!(
+                    "'{package}' exports NiceAuv2Factory, so it is an Audio Unit, but it has no AU identity: pass BundleInfo::au, or set au_type, au_subtype and au_manufacturer for it in bundler.toml"
+                );
+            };
+            if let Some(message) = au_component_error(&au) {
+                anyhow::bail!("'{package}': {message}");
+            }
+
+            let au_library_name = au_bundle_library_name(&bundle_name);
+            let au_lib_path = bundle_home_dir.join(&au_library_name);
+
+            fs::create_dir_all(au_lib_path.parent().unwrap())
+                .context("Could not create AU bundle directory")?;
+            util::reflink_or_combine(lib_paths, &au_lib_path, compilation_target)
+                .context("Could not create AU bundle")?;
+
+            let au_bundle_home = bundle_home_dir.join(
+                Path::new(&au_library_name)
+                    .components()
+                    .next()
+                    .expect("Malformed AU library path"),
+            );
+            maybe_create_macos_bundle_metadata_with_info(
+                package,
+                &bundle_name,
+                &au_bundle_home,
+                compilation_target,
+                BundleType::Plugin,
+                &bundle_identifier,
+                &bundle_version,
+                Some(&au),
+            )?;
+            maybe_codesign(&au_bundle_home, compilation_target);
+
+            eprintln!("Created an AU bundle at '{}'", au_bundle_home.display());
+        }
     }
     if !bundled_plugin {
         eprintln!("Not creating any plugin bundles because the package does not export any plugins")
@@ -810,6 +1006,13 @@ fn vst3_bundle_library_name(package: &str, target: CompilationTarget) -> String 
     }
 }
 
+// DELTON FORK DELTA (au-3)
+/// The full path to the library inside an Audio Unit bundle, including the leading `.component`
+/// directory.
+fn au_bundle_library_name(package: &str) -> String {
+    format!("{package}.component/Contents/MacOS/{package}")
+}
+
 /// If compiling for macOS, create all of the bundl-y stuff Steinberg and Apple require you to have.
 ///
 /// This still requires you to move the dylib file to `{bundle_home}/Contents/macOS/{package}`
@@ -831,11 +1034,14 @@ pub fn maybe_create_macos_bundle_metadata(
         bundle_type,
         &format!("com.nice-plug.{package}"),
         DEFAULT_BUNDLE_VERSION,
+        None,
     )
 }
 
 // DELTON FORK DELTA: like [`maybe_create_macos_bundle_metadata()`] with an explicit bundle
 // identifier and version.
+// DELTON FORK DELTA (au-3): the Audio Unit identity is the eighth argument.
+#[allow(clippy::too_many_arguments)]
 pub fn maybe_create_macos_bundle_metadata_with_info(
     _package: &str,
     display_name: &str,
@@ -844,6 +1050,8 @@ pub fn maybe_create_macos_bundle_metadata_with_info(
     bundle_type: BundleType,
     identifier: &str,
     version: &str,
+    // DELTON FORK DELTA (au-3)
+    au: Option<&AuComponentInfo>,
 ) -> Result<()> {
     if !matches!(
         target,
@@ -865,7 +1073,7 @@ pub fn maybe_create_macos_bundle_metadata_with_info(
     .context("Could not create PkgInfo file")?;
     fs::write(
         bundle_home.join("Contents").join("Info.plist"),
-        macos_info_plist(display_name, identifier, version, bundle_type),
+        macos_info_plist(display_name, identifier, version, bundle_type, au),
     )
     .context("Could not create Info.plist file")?;
 
@@ -880,11 +1088,16 @@ pub fn macos_info_plist(
     identifier: &str,
     version: &str,
     bundle_type: BundleType,
+    // DELTON FORK DELTA (au-3)
+    au: Option<&AuComponentInfo>,
 ) -> String {
     let package_type = match bundle_type {
         BundleType::Plugin => "BNDL",
         BundleType::Binary => "APPL",
     };
+    let au_block = au
+        .map(|au| au_components_block(au, version))
+        .unwrap_or_default();
     let display_name = xml_escape(display_name);
     let identifier = xml_escape(identifier);
     let version = xml_escape(version);
@@ -916,9 +1129,53 @@ pub fn macos_info_plist(
     <string></string>
     <key>NSHighResolutionCapable</key>
     <true/>
-  </dict>
+{au_block}  </dict>
 </plist>
 "#
+    )
+}
+
+// DELTON FORK DELTA (au-3): the `AudioComponents` entry, spliced in before the closing `</dict>`.
+fn au_components_block(au: &AuComponentInfo, version: &str) -> String {
+    let tags = if au.tags.is_empty() {
+        String::new()
+    } else {
+        let mut tags = String::from("        <key>tags</key>\n        <array>\n");
+        for tag in &au.tags {
+            tags.push_str(&format!("          <string>{}</string>\n", xml_escape(tag)));
+        }
+        tags.push_str("        </array>\n");
+        tags
+    };
+    format!(
+        r#"    <key>AudioComponents</key>
+    <array>
+      <dict>
+        <key>type</key>
+        <string>{au_type}</string>
+        <key>subtype</key>
+        <string>{subtype}</string>
+        <key>manufacturer</key>
+        <string>{manufacturer}</string>
+        <key>name</key>
+        <string>{name}</string>
+        <key>description</key>
+        <string>{description}</string>
+        <key>version</key>
+        <integer>{version_int}</integer>
+        <key>factoryFunction</key>
+        <string>NiceAuv2Factory</string>
+        <key>sandboxSafe</key>
+        <false/>
+{tags}      </dict>
+    </array>
+"#,
+        au_type = xml_escape(&au.au_type),
+        subtype = xml_escape(&au.subtype),
+        manufacturer = xml_escape(&au.manufacturer),
+        name = xml_escape(&au.name),
+        description = xml_escape(&au.description),
+        version_int = au_component_version(version),
     )
 }
 
@@ -995,18 +1252,18 @@ mod tests {
     fn defaults_reproduce_the_old_text() {
         let (id, ver) = resolve_bundle_identity("my_plug", &BundleInfo::default(), None);
         assert_eq!(
-            macos_info_plist("My Plug", &id, &ver, BundleType::Plugin),
+            macos_info_plist("My Plug", &id, &ver, BundleType::Plugin, None),
             legacy_plist("my_plug", "My Plug", "BNDL")
         );
         assert_eq!(
-            macos_info_plist("My Plug", &id, &ver, BundleType::Binary),
+            macos_info_plist("My Plug", &id, &ver, BundleType::Binary, None),
             legacy_plist("my_plug", "My Plug", "APPL")
         );
     }
 
     #[test]
     fn supplied_values_appear() {
-        let text = macos_info_plist("P", "com.acme.p", "2.3.4", BundleType::Plugin);
+        let text = macos_info_plist("P", "com.acme.p", "2.3.4", BundleType::Plugin, None);
         assert!(text.contains("<string>com.acme.p</string>"));
         assert_eq!(text.matches("<string>2.3.4</string>").count(), 2);
         assert!(!text.contains("com.nice-plug"));
@@ -1015,7 +1272,13 @@ mod tests {
 
     #[test]
     fn values_are_escaped() {
-        let text = macos_info_plist("A & <B> \"C\" 'D'", "com.a&b<\"", "1", BundleType::Plugin);
+        let text = macos_info_plist(
+            "A & <B> \"C\" 'D'",
+            "com.a&b<\"",
+            "1",
+            BundleType::Plugin,
+            None,
+        );
         assert!(text.contains("<string>A &amp; &lt;B&gt; &quot;C&quot; &apos;D&apos;</string>"));
         assert!(text.contains("<string>com.a&amp;b&lt;&quot;</string>"));
         assert!(!text.contains("A & "));
@@ -1027,10 +1290,17 @@ mod tests {
             name: None,
             bundle_identifier: Some("com.toml.id".into()),
             version: Some("3.0.0".into()),
+            au_type: None,
+            au_subtype: None,
+            au_manufacturer: None,
+            au_name: None,
+            au_description: None,
+            au_tags: None,
         };
         let caller = BundleInfo {
             identifier: Some("com.caller.id".into()),
             version: Some("4.0.0".into()),
+            au: None,
         };
         assert_eq!(
             resolve_bundle_identity("p", &caller, Some(&config)),
@@ -1043,6 +1313,7 @@ mod tests {
         let partial = BundleInfo {
             identifier: Some("com.caller.id".into()),
             version: None,
+            au: None,
         };
         assert_eq!(
             resolve_bundle_identity("p", &partial, Some(&config)),
@@ -1051,6 +1322,263 @@ mod tests {
         assert_eq!(
             resolve_bundle_identity("p", &BundleInfo::default(), None),
             ("com.nice-plug.p".to_string(), "1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn au_component_version_packs_the_parts() {
+        assert_eq!(au_component_version("1.2.3"), 0x0001_0203);
+        assert_eq!(au_component_version("0.10.0"), 0x0000_0A00);
+        assert_eq!(au_component_version("2"), 0x0002_0000);
+        assert_eq!(au_component_version("1.2.3-beta.4"), 0x0001_0203);
+        assert_eq!(au_component_version("1.2.3+build.9"), 0x0001_0203);
+        assert_eq!(au_component_version("1.x.3"), 0);
+        assert_eq!(au_component_version("1.300.2"), 0x0001_FF02);
+        assert_eq!(au_component_version(""), 0);
+        assert_eq!(au_component_version("70000.0.0"), 0xFFFF_0000);
+    }
+
+    // DELTON FORK DELTA (au-3): tests for the Audio Unit identity.
+    fn au_fixture() -> AuComponentInfo {
+        AuComponentInfo {
+            au_type: "aufx".into(),
+            subtype: "DlFt".into(),
+            manufacturer: "Dltn".into(),
+            name: "Delton Audio: Delay".into(),
+            description: "A delay".into(),
+            tags: vec!["Effects".into(), "Delay".into()],
+        }
+    }
+
+    fn au_config() -> PackageConfig {
+        PackageConfig {
+            name: None,
+            bundle_identifier: None,
+            version: None,
+            au_type: None,
+            au_subtype: None,
+            au_manufacturer: None,
+            au_name: None,
+            au_description: None,
+            au_tags: None,
+        }
+    }
+
+    #[test]
+    fn au_plist_block_exact() {
+        let text = macos_info_plist(
+            "Delay",
+            "com.d.delay",
+            "1.2.3",
+            BundleType::Plugin,
+            Some(&au_fixture()),
+        );
+        let expected = r#"<?xml version="1.0" encoding="UTF-8"?>
+
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist>
+  <dict>
+    <key>CFBundleExecutable</key>
+    <string>Delay</string>
+    <key>CFBundleIconFile</key>
+    <string></string>
+    <key>CFBundleIdentifier</key>
+    <string>com.d.delay</string>
+    <key>CFBundleName</key>
+    <string>Delay</string>
+    <key>CFBundleDisplayName</key>
+    <string>Delay</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.2.3</string>
+    <key>CFBundleVersion</key>
+    <string>1.2.3</string>
+    <key>NSHumanReadableCopyright</key>
+    <string></string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>AudioComponents</key>
+    <array>
+      <dict>
+        <key>type</key>
+        <string>aufx</string>
+        <key>subtype</key>
+        <string>DlFt</string>
+        <key>manufacturer</key>
+        <string>Dltn</string>
+        <key>name</key>
+        <string>Delton Audio: Delay</string>
+        <key>description</key>
+        <string>A delay</string>
+        <key>version</key>
+        <integer>66051</integer>
+        <key>factoryFunction</key>
+        <string>NiceAuv2Factory</string>
+        <key>sandboxSafe</key>
+        <false/>
+        <key>tags</key>
+        <array>
+          <string>Effects</string>
+          <string>Delay</string>
+        </array>
+      </dict>
+    </array>
+  </dict>
+</plist>
+"#;
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn au_plist_without_tags() {
+        let mut au = au_fixture();
+        au.tags.clear();
+        let text = macos_info_plist(
+            "Delay",
+            "com.d.delay",
+            "1.2.3",
+            BundleType::Plugin,
+            Some(&au),
+        );
+        assert!(!text.contains("<key>tags</key>"));
+        assert_eq!(text.matches("<string>NiceAuv2Factory</string>").count(), 1);
+    }
+
+    #[test]
+    fn au_plist_escapes() {
+        let mut au = au_fixture();
+        au.name = "A&B: <C>".into();
+        let text = macos_info_plist(
+            "Delay",
+            "com.d.delay",
+            "1.2.3",
+            BundleType::Plugin,
+            Some(&au),
+        );
+        assert!(text.contains("<string>A&amp;B: &lt;C&gt;</string>"));
+        assert!(!text.contains("A&B"));
+    }
+
+    #[test]
+    fn au_component_errors() {
+        let with = |au_type: &str, subtype: &str, manufacturer: &str| {
+            let mut au = au_fixture();
+            au.au_type = au_type.into();
+            au.subtype = subtype.into();
+            au.manufacturer = manufacturer.into();
+            au_component_error(&au)
+        };
+        assert_eq!(with("aufx", "DlFt", "Dltn"), None);
+        assert_eq!(
+            with("aufz", "DlFt", "Dltn"),
+            Some("AU type \"aufz\" is not one of aufx, aumf, aumu, aumi".to_string())
+        );
+        assert_eq!(
+            with("aufx", "DlF", "Dltn"),
+            Some("AU subtype \"DlF\" must be exactly 4 characters (got 3 bytes)".to_string())
+        );
+        assert_eq!(
+            with("aufx", "Dl\u{7f}t", "Dltn"),
+            Some("AU subtype \"Dl\u{7f}t\" must be printable ASCII".to_string())
+        );
+        assert_eq!(
+            with("aufx", "DlFt", "dltn"),
+            Some(
+                "AU manufacturer \"dltn\" is all lowercase letters, which Apple reserves"
+                    .to_string()
+            )
+        );
+        assert_eq!(with("aufx", "DlFt", "dlt1"), None);
+        assert_eq!(with("aufx", "DlFt", "DLTN"), None);
+        assert_eq!(with("aufx", "DlFt", "d lt"), None);
+        assert_eq!(
+            with("aufx", "DlFt", "Dltnx"),
+            Some(
+                "AU manufacturer \"Dltnx\" must be exactly 4 characters (got 5 bytes)".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn au_resolution() {
+        // The caller's value wins over a complete bundler.toml entry.
+        let full = PackageConfig {
+            au_type: Some("aumu".into()),
+            au_subtype: Some("Xxxx".into()),
+            au_manufacturer: Some("Yyyy".into()),
+            au_name: Some("From toml".into()),
+            au_description: Some("From toml too".into()),
+            au_tags: Some(vec!["Synth".into()]),
+            ..au_config()
+        };
+        let caller = BundleInfo {
+            au: Some(au_fixture()),
+            ..BundleInfo::default()
+        };
+        assert_eq!(
+            resolve_au_component(&caller, Some(&full), "Bn").unwrap(),
+            Some(au_fixture())
+        );
+
+        // Some AU fields without all three codes is an error.
+        let partial = PackageConfig {
+            au_subtype: Some("Xxxx".into()),
+            ..au_config()
+        };
+        let err = resolve_au_component(&BundleInfo::default(), Some(&partial), "Bn").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "bundler.toml: au_type, au_subtype and au_manufacturer go together (set all three or none)"
+        );
+
+        // The three codes alone: name and description fall back to the bundle name.
+        let codes = PackageConfig {
+            au_type: Some("aufx".into()),
+            au_subtype: Some("Xxxx".into()),
+            au_manufacturer: Some("Yyyy".into()),
+            ..au_config()
+        };
+        let resolved = resolve_au_component(&BundleInfo::default(), Some(&codes), "Bn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.name, "Bn");
+        assert_eq!(resolved.description, "Bn");
+        assert!(resolved.tags.is_empty());
+        assert_eq!(resolved.au_type, "aufx");
+        assert_eq!(resolved.subtype, "Xxxx");
+        assert_eq!(resolved.manufacturer, "Yyyy");
+
+        // A name alone becomes the description too.
+        let named = PackageConfig {
+            au_name: Some("N".into()),
+            au_description: None,
+            ..codes.clone()
+        };
+        let resolved = resolve_au_component(&BundleInfo::default(), Some(&named), "Bn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.name, "N");
+        assert_eq!(resolved.description, "N");
+
+        // Neither.
+        assert_eq!(
+            resolve_au_component(&BundleInfo::default(), None, "Bn").unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_au_component(&BundleInfo::default(), Some(&au_config()), "Bn").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn au_library_path() {
+        assert_eq!(
+            au_bundle_library_name("Delton Delay Fit"),
+            "Delton Delay Fit.component/Contents/MacOS/Delton Delay Fit"
         );
     }
 }

@@ -42,29 +42,6 @@ pub const fn manufacturer_valid(code: [u8; 4]) -> bool {
     false
 }
 
-/// `major << 16 | minor << 8 | patch` from "major.minor.patch". Anything from the first '-' or '+' on is
-/// ignored. A missing part is 0. A part that does not parse as u32 makes the whole result 0. major is
-/// clamped to 0xFFFF, minor and patch to 0xFF.
-// Used by the bundler (au-3); nothing in the wrapper needs it yet.
-#[allow(dead_code)]
-pub fn component_version(version: &str) -> u32 {
-    let core = version.split(['-', '+']).next().unwrap_or("");
-
-    let mut parts = [0u32; 3];
-    let mut text_parts = core.split('.');
-    for part in parts.iter_mut() {
-        match text_parts.next() {
-            Some(text) => match text.parse::<u32>() {
-                Ok(number) => *part = number,
-                Err(_) => return 0,
-            },
-            None => break,
-        }
-    }
-
-    (parts[0].min(0xFFFF) << 16) | (parts[1].min(0xFF) << 8) | parts[2].min(0xFF)
-}
-
 /// samples / sample_rate; 0.0 when sample_rate is not finite or <= 0.
 pub fn seconds_from_samples(samples: u32, sample_rate: f64) -> f64 {
     if sample_rate.is_finite() && sample_rate > 0.0 {
@@ -107,19 +84,6 @@ mod tests {
         assert!(!manufacturer_valid(*b"dltn"));
         assert!(manufacturer_valid(*b"dlt1"));
         assert!(!manufacturer_valid([b'D', b'l', 0x07, b'n']));
-    }
-
-    #[test]
-    fn component_version_packs_the_parts() {
-        assert_eq!(component_version("1.2.3"), 0x0001_0203);
-        assert_eq!(component_version("0.10.0"), 0x0000_0A00);
-        assert_eq!(component_version("2"), 0x0002_0000);
-        assert_eq!(component_version("1.2.3-beta.4"), 0x0001_0203);
-        assert_eq!(component_version("1.2.3+build.9"), 0x0001_0203);
-        assert_eq!(component_version("1.x.3"), 0);
-        assert_eq!(component_version("1.300.2"), 0x0001_FF02);
-        assert_eq!(component_version(""), 0);
-        assert_eq!(component_version("70000.0.0"), 0xFFFF_0000);
     }
 
     #[test]
