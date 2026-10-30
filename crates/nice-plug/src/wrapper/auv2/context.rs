@@ -1,17 +1,32 @@
 // DELTON FORK DELTA: au-1, AUv2 wrapper
-//! The contexts handed to the plugin: activate and process. (The GUI context arrives with the
-//! editor in au-2.)
+//! The contexts handed to the plugin: activate, process and (with the `editor` feature) the GUI
+//! context the editor gets in `spawn`.
 use atomic_refcell::AtomicRef;
 use nice_plug_core::audio_setup::ProcessMode;
 use nice_plug_core::context::activate::ActivateContext;
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+use nice_plug_core::context::gui::GuiContextInner;
 use nice_plug_core::context::process::{
     ParamAutomationPoint, ProcessContext, SendEventError, Transport,
 };
 use nice_plug_core::context::PluginApi;
 use nice_plug_core::midi::PluginNoteEvent;
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+use nice_plug_core::params::internals::ParamPtr;
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+use nice_plug_core::plugin::PluginState;
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+use std::sync::Weak;
 
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+use super::sys::AudioUnitEventType;
 use super::wrapper::{Task, Wrapper};
 use super::AuPlugin;
 use crate::wrapper::util::raw_automation::RawAutomation;
@@ -105,6 +120,112 @@ impl<P: AuPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
 
     fn set_current_voice_capacity(&self, _capacity: u32) {
         // This is only supported by CLAP
+    }
+
+    fn request_restart(&self) {
+        // AU has no restart request; hosts re-read properties when the wrapper notifies them
+        crate::nice_warn!("AUv2 has no restart request, ignoring");
+    }
+}
+
+/// A [`GuiContext`][nice_plug_core::context::gui::GuiContext] implementation for the wrapper. This
+/// is passed to the plugin in `Editor::spawn()` so it can interact with the rest of the plugin and
+/// with the host for things like setting parameters.
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+pub(crate) struct WrapperGuiContext<P: AuPlugin> {
+    pub(super) inner: Weak<Wrapper<P>>,
+    #[cfg(debug_assertions)]
+    pub(super) param_gesture_checker:
+        atomic_refcell::AtomicRefCell<crate::wrapper::util::context_checks::ParamGestureChecker>,
+}
+
+#[cfg(feature = "editor")]
+impl<P: AuPlugin> WrapperGuiContext<P> {
+    /// The wrapper and the AU parameter ID of `param`, or `None` if the wrapper is gone or the
+    /// parameter is not one of the plugin's.
+    fn wrapper_and_hash(&self, param: ParamPtr) -> Option<(std::sync::Arc<Wrapper<P>>, u32)> {
+        let wrapper = self.inner.upgrade()?;
+        let Some(&hash) = wrapper.param_ptr_to_hash.get(&param) else {
+            crate::nice_debug_assert_failure!("Unknown parameter: {:?}", param);
+            return None;
+        };
+
+        Some((wrapper, hash))
+    }
+}
+
+#[cfg(feature = "editor")]
+impl<P: AuPlugin> GuiContextInner for WrapperGuiContext<P> {
+    fn plugin_api(&self) -> PluginApi {
+        PluginApi::Auv2
+    }
+
+    // All of these functions are supposed to be called from the main thread, so we'll put some
+    // trust in the caller and assume that this is indeed the case
+    unsafe fn raw_begin_set_parameter(&self, param: ParamPtr) {
+        let Some((wrapper, hash)) = self.wrapper_and_hash(param) else {
+            return;
+        };
+
+        wrapper.notify_parameter_event(AudioUnitEventType::BeginParameterChangeGesture, hash);
+
+        #[cfg(debug_assertions)]
+        if let Some(entry) = wrapper.table.get(hash) {
+            self.param_gesture_checker
+                .borrow_mut()
+                .begin_set_parameter(&entry.string_id);
+        }
+    }
+
+    unsafe fn raw_set_parameter_normalized(&self, param: ParamPtr, normalized: f32) {
+        let Some((wrapper, hash)) = self.wrapper_and_hash(param) else {
+            return;
+        };
+
+        wrapper.apply_editor_parameter(hash, normalized);
+
+        #[cfg(debug_assertions)]
+        if let Some(entry) = wrapper.table.get(hash) {
+            self.param_gesture_checker
+                .borrow()
+                .set_parameter(&entry.string_id);
+        }
+    }
+
+    unsafe fn raw_end_set_parameter(&self, param: ParamPtr) {
+        let Some((wrapper, hash)) = self.wrapper_and_hash(param) else {
+            return;
+        };
+
+        wrapper.notify_parameter_event(AudioUnitEventType::EndParameterChangeGesture, hash);
+
+        #[cfg(debug_assertions)]
+        if let Some(entry) = wrapper.table.get(hash) {
+            self.param_gesture_checker
+                .borrow_mut()
+                .end_set_parameter(&entry.string_id);
+        }
+    }
+
+    fn get_state(&self) -> PluginState {
+        match self.inner.upgrade() {
+            Some(wrapper) => wrapper.get_state_object(),
+            None => {
+                crate::nice_debug_assert_failure!("get_state() called after the plugin was closed");
+                PluginState {
+                    version: String::new(),
+                    params: Default::default(),
+                    fields: Default::default(),
+                }
+            }
+        }
+    }
+
+    fn set_state(&self, state: PluginState) {
+        if let Some(wrapper) = self.inner.upgrade() {
+            wrapper.set_state_object_from_gui(state);
+        }
     }
 
     fn request_restart(&self) {

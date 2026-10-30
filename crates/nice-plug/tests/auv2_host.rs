@@ -30,6 +30,8 @@ use objc2_audio_toolbox::{
     AudioUnitRemoveRenderNotify, AudioUnitRender, AudioUnitRenderActionFlags,
     AudioUnitSetParameter, AudioUnitSetProperty, AudioUnitUninitialize,
 };
+// DELTON FORK DELTA: au-2
+use objc2_audio_toolbox::{kAudioUnitErr_InvalidProperty, kAudioUnitProperty_CocoaUI};
 use objc2_core_audio_types::{
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
     kAudioFormatLinearPCM, AudioBuffer, AudioBufferList, AudioStreamBasicDescription,
@@ -759,3 +761,23 @@ fn render_notify() {
 
 // A property listener on `Latency` is called from the wrapper's event loop on the main thread,
 // which a test process does not run. That path is checked by auval and on a Mac with a DAW.
+
+// DELTON FORK DELTA: au-2
+#[test]
+fn no_editor_means_no_cocoa_ui() {
+    // TestGain has `Editor = ()`
+    let unit = Unit::new();
+    let mut size = 0u32;
+    let mut writable = 0u8;
+    let status = unsafe {
+        AudioUnitGetPropertyInfo(
+            unit.0,
+            kAudioUnitProperty_CocoaUI,
+            kAudioUnitScope_Global,
+            0,
+            &mut size,
+            &mut writable,
+        )
+    };
+    assert_eq!(status, kAudioUnitErr_InvalidProperty);
+}

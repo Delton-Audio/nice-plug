@@ -152,3 +152,10 @@ features = [
 
 [dev-dependencies]
 approx.workspace = true
+
+# DELTON FORK DELTA (au-2): the AU editor test runs on the main thread, so it has its own main()
+[[test]]
+name = "auv2_view"
+path = "tests/auv2_view.rs"
+harness = false
+required-features = ["auv2", "editor"]

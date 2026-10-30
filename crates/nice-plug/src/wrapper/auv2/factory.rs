@@ -139,6 +139,9 @@ unsafe extern "C-unwind" fn close<P: AuPlugin>(this: NonNull<c_void>) -> OSStatu
         // SAFETY: `this` is the pointer `factory` returned, and the host does not use it again.
         let instance = unsafe { Box::from_raw(this.as_ptr() as *mut AuInstance<P>) };
         if let Some(wrapper) = &instance.wrapper {
+            // DELTON FORK DELTA: au-2 (the editor goes before the plugin is deactivated)
+            #[cfg(feature = "editor")]
+            wrapper.close_editor();
             wrapper.uninitialize();
         }
         drop(instance);

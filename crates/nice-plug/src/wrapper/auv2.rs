@@ -7,6 +7,8 @@ pub(crate) mod convert;
 pub(crate) mod layout;
 pub(crate) mod param_table;
 pub(crate) mod render_check;
+// DELTON FORK DELTA: au-2
+pub(crate) mod view_names;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod buffers;
@@ -19,6 +21,9 @@ pub mod factory;
 pub(crate) mod state;
 #[cfg(target_os = "macos")]
 pub(crate) mod sys;
+// DELTON FORK DELTA: au-2
+#[cfg(all(target_os = "macos", feature = "editor"))]
+pub(crate) mod view;
 #[cfg(target_os = "macos")]
 pub(crate) mod wrapper;
 

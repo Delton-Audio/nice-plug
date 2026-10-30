@@ -9,8 +9,20 @@ use atomic_refcell::AtomicRefCell;
 use crossbeam::atomic::AtomicCell;
 use crossbeam::channel;
 use crossbeam::queue::ArrayQueue;
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+use fragile::Fragile;
 use nice_plug_core::audio_setup::{AudioIOLayout, AuxiliaryBuffers, BufferConfig, ProcessMode};
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+use nice_plug_core::context::gui::{AsyncExecutor, GuiContext};
 use nice_plug_core::context::process::{ParamAutomationPoint, Transport};
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+use nice_plug_core::editor::dpi::{NativeSize, Size};
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+use nice_plug_core::editor::{Editor, EditorHandle, SpawnedEditor};
 use nice_plug_core::params::internals::ParamPtr;
 use nice_plug_core::params::{ParamFlags, Params};
 use nice_plug_core::plugin::{PluginState, ProcessStatus, TaskExecutor};
@@ -23,12 +35,15 @@ use std::ptr::{self, NonNull};
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use try_lock::TryLock;
 
 use super::buffers::AuBuffers;
 use super::context::{WrapperActivateContext, WrapperProcessContext};
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+use super::context::WrapperGuiContext;
 use super::convert::{seconds_from_samples, tail_seconds};
 use super::layout::{
     au_layouts, channels_allowed, element_channels, pick_layout, supported_channels, ChannelPair,
@@ -38,6 +53,9 @@ use super::param_table::{au_from_normalized, normalized_from_au, AuParamKind, Au
 use super::render_check::{check_render, RenderCheck, RenderError};
 use super::state;
 use super::sys::*;
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+use super::view;
 use super::AuPlugin;
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::util::permit_alloc;
@@ -62,14 +80,35 @@ const RENDER_QUALITY: u32 = kRenderQuality_Max;
 pub enum Task<P: AuPlugin> {
     /// Execute one of the plugin's background tasks.
     PluginTask(P::BackgroundTask),
-    /// One parameter's value was changed by the host. au-2: the editor reads this.
-    #[allow(dead_code)]
+    /// One parameter's value was changed by the host or the editor. The editor is told.
+    // DELTON FORK DELTA: au-2
+    #[cfg_attr(not(feature = "editor"), allow(dead_code))]
     ParameterValueChanged(u32, f32),
-    /// Parameter values changed all at once (a state load). Tells the host's parameter listeners,
-    /// and in au-2 the editor.
+    /// Parameter values changed all at once (a state load). Tells the host's parameter listeners
+    /// and the editor.
     StateChanged,
     /// The plugin's latency changed: tells the `Latency` property listeners.
     LatencyChanged,
+    /// The editor asked for a new size: resize its container (main thread).
+    // DELTON FORK DELTA: au-2
+    #[cfg(feature = "editor")]
+    RequestResize { size: Size, scale_factor: f64 },
+    /// The editor's `HostMainThreadCaller` fired.
+    // DELTON FORK DELTA: au-2
+    #[cfg(feature = "editor")]
+    CallMainThread,
+}
+
+/// The open editor and the container view it lives in.
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+pub(super) struct EditorSlot<P: AuPlugin> {
+    /// The container NSView (`*mut AnyObject` as usize). Not retained: the container's dealloc
+    /// closes this slot before the container goes away.
+    pub container: usize,
+    /// Whether `viewDidMoveToWindow` hid the editor.
+    pub hidden: Cell<bool>,
+    pub spawned: SpawnedEditor<<P::Editor as Editor>::Handle>,
 }
 
 /// The format of one stream (one input or output element).
@@ -239,6 +278,9 @@ enum Prop {
     RenderQuality,
     OfflineRender,
     Private,
+    // DELTON FORK DELTA: au-2
+    #[cfg(feature = "editor")]
+    CocoaUI,
 }
 
 /// The scopes a property exists in.
@@ -287,6 +329,9 @@ impl Prop {
             kAudioUnitProperty_RenderQuality => Prop::RenderQuality,
             kAudioUnitProperty_OfflineRender => Prop::OfflineRender,
             PRIVATE_WRAPPER_PROPERTY => Prop::Private,
+            // DELTON FORK DELTA: au-2
+            #[cfg(feature = "editor")]
+            kAudioUnitProperty_CocoaUI => Prop::CocoaUI,
             _ => return None,
         })
     }
@@ -329,6 +374,10 @@ impl Prop {
 pub(crate) struct Wrapper<P: AuPlugin> {
     /// The AudioUnit handle `Open` received. Listeners need it.
     unit: UnitHandle,
+    /// This wrapper, for the view factory (which only gets a pointer through the private property).
+    // DELTON FORK DELTA: au-2
+    #[cfg_attr(not(feature = "editor"), allow(dead_code))]
+    pub(super) this: Weak<Self>,
 
     /// The wrapped plugin instance.
     pub(super) plugin: TryLock<P>,
@@ -339,7 +388,7 @@ pub(crate) struct Wrapper<P: AuPlugin> {
     /// the `Params` object without having to acquire a lock on `plugin`.
     pub(super) params: Arc<dyn Params>,
     /// The AU view of the parameters.
-    table: AuParamTable,
+    pub(super) table: AuParamTable,
     /// The ID of the first parameter flagged `BYPASS`, if any.
     bypass_id: Option<u32>,
     /// One `CFString` per table entry, made at Open, that `ParameterInfo` hands out as
@@ -351,6 +400,20 @@ pub(crate) struct Wrapper<P: AuPlugin> {
     pub(super) param_by_hash: HashMap<u32, ParamPtr>,
     /// String parameter ID to hash, for state.
     pub(super) param_id_to_hash: HashMap<String, u32>,
+    /// ParamPtr to hash, for the GUI context.
+    // DELTON FORK DELTA: au-2
+    #[cfg_attr(not(feature = "editor"), allow(dead_code))]
+    pub(super) param_ptr_to_hash: HashMap<ParamPtr, u32>,
+    /// The plugin's editor, created at Open. Wrapped in an `AtomicRefCell` because it needs the
+    /// `Arc` to exist first.
+    // DELTON FORK DELTA: au-2
+    #[cfg(feature = "editor")]
+    pub(super) editor: AtomicRefCell<Option<Arc<Mutex<P::Editor>>>>,
+    /// The open editor, if any, and the container view it lives in. Only touched on the main
+    /// thread, and only through `try_borrow` and `try_borrow_mut`.
+    // DELTON FORK DELTA: au-2
+    #[cfg(feature = "editor")]
+    pub(super) editor_slot: AtomicRefCell<Option<Fragile<EditorSlot<P>>>>,
 
     /// A realtime-safe task queue so the wrapper can schedule tasks that need to run on the main
     /// thread. Posted to through [`Self::schedule_gui()`]. Initialized late: it needs the `Arc`.
@@ -397,8 +460,9 @@ pub(crate) struct Wrapper<P: AuPlugin> {
     /// The plugin is able to restore state through a method on the `GuiContext`. To avoid changing
     /// parameters mid-processing, the restoring happens at the end of each render: the audio thread
     /// takes the state out of this zero capacity channel, restores it, and sends it back so it is
-    /// deallocated on the GUI thread. au-2 sends from the editor.
-    #[allow(dead_code)]
+    /// deallocated on the GUI thread. The editor sends.
+    // DELTON FORK DELTA: au-2
+    #[cfg_attr(not(feature = "editor"), allow(dead_code))]
     updated_state_sender: channel::Sender<PluginState>,
     updated_state_receiver: channel::Receiver<PluginState>,
 }
@@ -468,6 +532,12 @@ impl<P: AuPlugin> Wrapper<P> {
             .iter()
             .map(|entry| (entry.string_id.clone(), entry.id))
             .collect();
+        // DELTON FORK DELTA: au-2
+        let param_ptr_to_hash = table
+            .entries
+            .iter()
+            .map(|entry| (entry.ptr, entry.id))
+            .collect();
         let bypass_id = table.bypass_id();
 
         let make_formats = |channels: &[u32]| -> Vec<StreamFormat> {
@@ -490,8 +560,10 @@ impl<P: AuPlugin> Wrapper<P> {
             P::INPUT_EVENT_CAPACITY
         };
 
-        let wrapper = Arc::new(Self {
+        // DELTON FORK DELTA: au-2 (`this` is for the view factory)
+        let wrapper = Arc::new_cyclic(|this| Self {
             unit: UnitHandle(unit),
+            this: this.clone(),
             plugin: TryLock::new(plugin),
             task_executor,
             params,
@@ -500,6 +572,11 @@ impl<P: AuPlugin> Wrapper<P> {
             cf_names,
             param_by_hash,
             param_id_to_hash,
+            param_ptr_to_hash,
+            #[cfg(feature = "editor")]
+            editor: AtomicRefCell::new(None),
+            #[cfg(feature = "editor")]
+            editor_slot: AtomicRefCell::new(None),
             event_loop: AtomicRefCell::new(None),
 
             input_sources: (0..shape.input_elements())
@@ -549,6 +626,47 @@ impl<P: AuPlugin> Wrapper<P> {
         // The event loop needs the `Arc` to hold a weak reference to the wrapper
         *wrapper.event_loop.borrow_mut() =
             Some(OsEventLoop::new_and_spawn(Arc::downgrade(&wrapper)));
+
+        // The editor also needs to be initialized late so the async executor can work
+        // DELTON FORK DELTA: au-2
+        #[cfg(feature = "editor")]
+        {
+            *wrapper.editor.borrow_mut() = wrapper
+                .plugin
+                .try_lock()
+                .unwrap()
+                .editor(AsyncExecutor::new(
+                    Arc::new({
+                        let wrapper = Arc::downgrade(&wrapper);
+                        move |task| {
+                            let Some(wrapper) = wrapper.upgrade() else {
+                                return;
+                            };
+
+                            let task_posted = wrapper.schedule_background(Task::PluginTask(task));
+                            crate::nice_debug_assert!(
+                                task_posted,
+                                "The task queue is full, dropping task..."
+                            );
+                        }
+                    }),
+                    Arc::new({
+                        let wrapper = Arc::downgrade(&wrapper);
+                        move |task| {
+                            let Some(wrapper) = wrapper.upgrade() else {
+                                return;
+                            };
+
+                            let task_posted = wrapper.schedule_gui(Task::PluginTask(task));
+                            crate::nice_debug_assert!(
+                                task_posted,
+                                "The task queue is full, dropping task..."
+                            );
+                        }
+                    }),
+                ))
+                .map(|editor| Arc::new(Mutex::new(editor)));
+        }
 
         Ok(wrapper)
     }
@@ -1147,6 +1265,14 @@ impl<P: AuPlugin> Wrapper<P> {
             Prop::HostCallbacks => size_of::<HostCallbackInfo>(),
             Prop::FactoryPresets | Prop::ElementName | Prop::Private => size_of::<*const c_void>(),
             Prop::PresentPreset => size_of::<AUPreset>(),
+            // DELTON FORK DELTA: au-2
+            #[cfg(feature = "editor")]
+            Prop::CocoaUI => {
+                if self.editor.borrow().is_none() {
+                    return Err(kAudioUnitErr_InvalidProperty);
+                }
+                size_of::<AudioUnitCocoaViewInfo>()
+            }
         };
 
         Ok((size as u32, prop.writable()))
@@ -1496,6 +1622,12 @@ impl<P: AuPlugin> Wrapper<P> {
                 put!((self.current_process_mode.load() == ProcessMode::Offline) as u32)
             }
             Prop::Private => put!(self as *const Self as *const c_void),
+            // DELTON FORK DELTA: au-2
+            #[cfg(feature = "editor")]
+            Prop::CocoaUI => match view::cocoa_view_info::<P>() {
+                Some(info) => put!(info),
+                None => return kAudioUnitErr_CannotDoInCurrentContext,
+            },
             // Handled before the size check
             Prop::ClassInfoFromDocument | Prop::SetRenderCallback | Prop::MakeConnection => {
                 return kAudioUnitErr_InvalidProperty;
@@ -1738,6 +1870,9 @@ impl<P: AuPlugin> Wrapper<P> {
             | Prop::FactoryPresets
             | Prop::ElementName
             | Prop::Private => return kAudioUnitErr_PropertyNotWritable,
+            // DELTON FORK DELTA: au-2
+            #[cfg(feature = "editor")]
+            Prop::CocoaUI => return kAudioUnitErr_PropertyNotWritable,
         }
 
         NO_ERR
@@ -2105,13 +2240,253 @@ impl<P: AuPlugin> Wrapper<P> {
     }
 }
 
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+impl<P: AuPlugin> Wrapper<P> {
+    pub(super) fn make_gui_context(self: Arc<Self>) -> GuiContext {
+        GuiContext::new(Arc::new(WrapperGuiContext {
+            inner: Arc::downgrade(&self),
+            #[cfg(debug_assertions)]
+            param_gesture_checker: Default::default(),
+        }))
+    }
+
+    /// Whether the calling thread is the main thread.
+    pub(super) fn is_main_thread(&self) -> bool {
+        self.event_loop
+            .borrow()
+            .as_ref()
+            .is_some_and(|event_loop| event_loop.is_main_thread())
+    }
+
+    /// Get the plugin's state object, may be called by the plugin's GUI as part of its own preset
+    /// management.
+    pub(super) fn get_state_object(&self) -> PluginState {
+        // SAFETY: The pointers in the maps come from `self.params`, which this wrapper keeps alive.
+        unsafe {
+            crate::wrapper::state::serialize_object::<P>(
+                self.params.clone(),
+                crate::wrapper::state::make_params_iter(
+                    &self.param_by_hash,
+                    &self.param_id_to_hash,
+                ),
+            )
+        }
+    }
+
+    /// Update the plugin's state, called by the plugin itself from the GUI thread. While the unit
+    /// is rendering, the state goes to the render thread, which applies it at the end of the
+    /// block. A unit can be initialized without anyone rendering it (a host may stop rendering
+    /// idle tracks), so this waits for the render thread for 100 ms at most and then applies the
+    /// state on this thread.
+    pub(super) fn set_state_object_from_gui(&self, mut state: PluginState) {
+        use crossbeam::channel::SendTimeoutError;
+
+        if self.initialized.load(Ordering::Acquire) {
+            match self
+                .updated_state_sender
+                .send_timeout(state, Duration::from_millis(100))
+            {
+                Ok(()) => {
+                    // The state object comes back to this thread so it is deallocated here
+                    let returned = self.updated_state_receiver.recv();
+                    drop(returned);
+                }
+                Err(SendTimeoutError::Timeout(mut state)) => {
+                    self.set_state_inner(&mut state);
+                }
+                Err(SendTimeoutError::Disconnected(_)) => {
+                    crate::nice_debug_assert_failure!("State update channel got disconnected");
+                }
+            }
+        } else {
+            self.set_state_inner(&mut state);
+        }
+    }
+
+    /// A GUI edit: set the parameter now, the same way a host `SetParameter` would, and tell the
+    /// host's listeners.
+    pub(super) fn apply_editor_parameter(&self, hash: u32, normalized: f32) {
+        let Some(&ptr) = self.param_by_hash.get(&hash) else {
+            crate::nice_debug_assert_failure!("Unknown parameter hash: {}", hash);
+            return;
+        };
+
+        self.apply_host_parameter(hash, ptr, normalized, 0);
+        self.notify_parameter_event(AudioUnitEventType::ParameterValueChange, hash);
+    }
+
+    /// Tell the host's listeners about a gesture or a value change of one parameter.
+    pub(super) fn notify_parameter_event(&self, event_type: AudioUnitEventType, hash: u32) {
+        let event = AudioUnitEvent {
+            event_type,
+            argument: AudioUnitEventArgument {
+                parameter: AudioUnitParameter {
+                    mAudioUnit: self.unit.0,
+                    mParameterID: hash,
+                    mScope: kAudioUnitScope_Global,
+                    mElement: 0,
+                },
+            },
+        };
+
+        // SAFETY: A null listener and object tell every listener, including the host's. The event
+        // outlives the call.
+        let status = unsafe { AUEventListenerNotify(ptr::null_mut(), ptr::null_mut(), &event) };
+        crate::nice_debug_assert!(
+            status == NO_ERR,
+            "AUEventListenerNotify failed with status {}",
+            status
+        );
+    }
+
+    /// Run `f` on the open editor, if there is one. Does nothing if there is none, if the slot is
+    /// busy (an editor call is further up the stack), or if the slot belongs to another thread.
+    fn with_open_editor(&self, f: impl FnOnce(&EditorSlot<P>)) {
+        let Ok(slot) = self.editor_slot.try_borrow() else {
+            return;
+        };
+        let Some(Ok(slot)) = slot.as_ref().map(|slot| slot.try_get()) else {
+            return;
+        };
+
+        f(slot);
+    }
+
+    /// Close the open editor, whichever container it is in. The factory's `close` calls this.
+    pub(crate) fn close_editor(&self) {
+        self.take_editor(None);
+    }
+
+    /// Close the open editor only if it lives in `container`. The container's dealloc calls this.
+    pub(super) fn close_editor_for(&self, container: usize) {
+        self.take_editor(Some(container));
+    }
+
+    /// Take the open editor out of its slot and drop it, if it lives in `only_container` (or if
+    /// that is `None`).
+    fn take_editor(&self, only_container: Option<usize>) {
+        if !self.is_main_thread() {
+            match only_container {
+                // A container released off the main thread cannot be matched to the slot
+                Some(_) => crate::nice_error!(
+                    "AU: the editor's view was released off the main thread; the editor stays open"
+                ),
+                None => {
+                    let slot = match self.editor_slot.try_borrow_mut() {
+                        Ok(mut slot) => slot.take(),
+                        Err(_) => {
+                            crate::nice_error!("AU: the editor is busy, cannot close it");
+                            return;
+                        }
+                    };
+                    if let Some(slot) = slot {
+                        crate::nice_error!(
+                            "AU: the editor must be closed on the main thread; leaking it"
+                        );
+                        // Dropping a `Fragile` on another thread panics
+                        std::mem::forget(slot);
+                    }
+                }
+            }
+            return;
+        }
+
+        // The guard is gone before the slot is dropped, so a re-entrant call from the editor's
+        // drop finds the slot empty instead of panicking
+        let slot = match self.editor_slot.try_borrow_mut() {
+            Ok(mut slot) => {
+                let matches = match (slot.as_ref(), only_container) {
+                    (Some(_), None) => true,
+                    (Some(slot), Some(container)) => {
+                        slot.try_get().is_ok_and(|slot| slot.container == container)
+                    }
+                    (None, _) => false,
+                };
+                if matches {
+                    slot.take()
+                } else {
+                    None
+                }
+            }
+            Err(_) => {
+                crate::nice_error!("AU: the editor is busy, cannot close it");
+                return;
+            }
+        };
+        drop(slot);
+    }
+
+    /// The container moved into (`true`) or out of (`false`) a window: show or hide the editor.
+    pub(super) fn container_moved_to_window(&self, container: usize, in_window: bool) {
+        self.with_open_editor(|slot| {
+            if slot.container != container {
+                return;
+            }
+
+            if !in_window && !slot.hidden.get() {
+                if let Err(err) = slot.spawned.handle.hide(&slot.spawned.window) {
+                    crate::nice_warn!("AU: failed to hide the editor: {}", err);
+                }
+                slot.hidden.set(true);
+            } else if in_window && slot.hidden.get() {
+                if let Err(err) = slot.spawned.handle.show(&slot.spawned.window) {
+                    crate::nice_warn!("AU: failed to show the editor: {}", err);
+                }
+                slot.hidden.set(false);
+            }
+        });
+    }
+
+    /// Someone other than the editor resized `container`: forward to the editor if it is
+    /// resizable.
+    pub(super) fn container_resized_by_host(&self, container: usize, size: NativeSize<u32>) {
+        // `try_lock`: the editor is locked while it spawns, and it may resize its parent from there
+        let can_resize = match self.editor.borrow().as_ref() {
+            Some(editor) => editor
+                .try_lock()
+                .is_some_and(|editor| editor.resize_hint().can_resize),
+            None => false,
+        };
+        if !can_resize {
+            return;
+        }
+
+        self.with_open_editor(|slot| {
+            if slot.container != container {
+                return;
+            }
+
+            if let Err(err) = slot.spawned.handle.set_size(size, &slot.spawned.window) {
+                crate::nice_warn!("AU: the editor refused the host's resize: {}", err);
+            }
+        });
+    }
+
+    /// The editor asked for `size`: resize the container without forwarding it back.
+    fn resize_container_from_editor(&self, size: NativeSize<u32>) {
+        self.with_open_editor(|slot| view::set_container_size_from_editor(slot.container, size));
+    }
+}
+
 impl<P: AuPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
     fn execute(&self, task: Task<P>, _is_gui_thread: bool) {
         // This function is always called from the main thread
         match task {
             Task::PluginTask(task) => (self.task_executor.lock())(task),
-            // au-2: editor
-            Task::ParameterValueChanged(..) => (),
+            // DELTON FORK DELTA: au-2
+            Task::ParameterValueChanged(hash, normalized) => {
+                #[cfg(feature = "editor")]
+                if let Some(entry) = self.table.get(hash) {
+                    self.with_open_editor(|slot| {
+                        slot.spawned
+                            .handle
+                            .param_value_changed(&entry.string_id, normalized)
+                    });
+                }
+                #[cfg(not(feature = "editor"))]
+                let _ = (hash, normalized);
+            }
             Task::StateChanged => {
                 for entry in &self.table.entries {
                     let mut parameter = AudioUnitParameter {
@@ -2129,17 +2504,44 @@ impl<P: AuPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                         )
                     };
                 }
-                // au-2: editor
+                // DELTON FORK DELTA: au-2
+                #[cfg(feature = "editor")]
+                self.with_open_editor(|slot| slot.spawned.handle.state_changed());
             }
             Task::LatencyChanged => {
                 self.notify_property(kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0)
             }
+            // DELTON FORK DELTA: au-2
+            #[cfg(feature = "editor")]
+            Task::RequestResize { size, scale_factor } => {
+                self.resize_container_from_editor(NativeSize::<u32>::from_size(size, scale_factor))
+            }
+            #[cfg(feature = "editor")]
+            Task::CallMainThread => self.with_open_editor(|slot| {
+                slot.spawned
+                    .handle
+                    .host_main_thread_callback(&slot.spawned.window)
+            }),
         }
     }
 }
 
 impl<P: AuPlugin> Drop for Wrapper<P> {
     fn drop(&mut self) {
+        // DELTON FORK DELTA: au-2
+        #[cfg(feature = "editor")]
+        if let Some(slot) = self.editor_slot.get_mut().take() {
+            if self.is_main_thread() {
+                drop(slot);
+            } else {
+                crate::nice_error!(
+                    "AU: the wrapper was dropped off the main thread with an editor open; leaking \
+                     the editor"
+                );
+                std::mem::forget(slot);
+            }
+        }
+
         for &address in &self.cf_names {
             if let Some(string) = NonNull::new(address as *mut CFString) {
                 // SAFETY: These are the references `new` leaked with `CFRetained::into_raw`.

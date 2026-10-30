@@ -177,3 +177,66 @@ pub(crate) struct UnitHandle(pub AudioComponentInstance);
 unsafe impl Send for UnitHandle {}
 // SAFETY: See above.
 unsafe impl Sync for UnitHandle {}
+
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+pub(crate) use objc2_audio_toolbox::{
+    kAudioUnitProperty_CocoaUI, AudioComponentDescription, AudioComponentGetDescription,
+    AudioComponentInstanceGetComponent, AudioUnitCocoaViewInfo, AudioUnitEventType,
+    AudioUnitGetProperty, AudioUnitProperty,
+};
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+pub(crate) use objc2_core_foundation::{CFURLPathStyle, CFURL};
+
+/// The argument union of [`AudioUnitEvent`].
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) union AudioUnitEventArgument {
+    pub parameter: AudioUnitParameter,
+    pub property: AudioUnitProperty,
+}
+
+/// `AudioUnitEvent`, which the generated bindings lack.
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct AudioUnitEvent {
+    pub event_type: AudioUnitEventType,
+    pub argument: AudioUnitEventArgument,
+}
+
+#[cfg(feature = "editor")]
+const _: () = assert!(std::mem::size_of::<AudioUnitEvent>() == 32);
+
+/// `Dl_info`, for `dladdr`.
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+#[repr(C)]
+pub(crate) struct DlInfo {
+    pub dli_fname: *const std::ffi::c_char,
+    pub dli_fbase: *mut c_void,
+    pub dli_sname: *const std::ffi::c_char,
+    pub dli_saddr: *mut c_void,
+}
+
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+unsafe extern "C-unwind" {
+    /// `AUEventListenerNotify` (AudioToolbox). A null listener and object tell every listener.
+    pub(crate) fn AUEventListenerNotify(
+        sending_listener: *mut c_void,
+        sending_object: *mut c_void,
+        event: *const AudioUnitEvent,
+    ) -> OSStatus;
+}
+
+// DELTON FORK DELTA: au-2
+#[cfg(feature = "editor")]
+unsafe extern "C" {
+    /// `dladdr` (libSystem).
+    pub(crate) fn dladdr(addr: *const c_void, info: *mut DlInfo) -> std::ffi::c_int;
+}
