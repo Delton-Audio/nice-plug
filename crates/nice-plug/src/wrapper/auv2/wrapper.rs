@@ -1484,7 +1484,9 @@ impl<P: AuPlugin> Wrapper<P> {
                     clumpID: entry.clump.unwrap_or(0),
                     cfNameString: self.cf_names[idx] as *const CFString,
                     unit: match entry.kind {
-                        AuParamKind::Continuous => AudioUnitParameterUnit::Generic,
+                        AuParamKind::Continuous | AuParamKind::Stepped { .. } => {
+                            AudioUnitParameterUnit::Generic
+                        }
                         AuParamKind::Indexed { .. } => AudioUnitParameterUnit::Indexed,
                         AuParamKind::Boolean => AudioUnitParameterUnit::Boolean,
                     },
@@ -1586,7 +1588,8 @@ impl<P: AuPlugin> Wrapper<P> {
                 info.transportStateProc2 = stored.transport_state2;
                 put!(info)
             }
-            Prop::InPlaceProcessing => put!(1u32),
+            // DELTON FORK DELTA: au-3, a null output `mData` gets our buffer, not the input's
+            Prop::InPlaceProcessing => put!(0u32),
             Prop::ShouldAllocateBuffer => {
                 put!(
                     self.should_allocate[(scope == kAudioUnitScope_Output) as usize]
@@ -1764,7 +1767,14 @@ impl<P: AuPlugin> Wrapper<P> {
                 if frames == 0 {
                     return kAudioUnitErr_InvalidPropertyValue;
                 }
-                self.max_frames.store(frames, Ordering::Relaxed);
+                // DELTON FORK DELTA: au-3, auval requires the change notification
+                if self.max_frames.swap(frames, Ordering::Relaxed) != frames {
+                    self.notify_property(
+                        kAudioUnitProperty_MaximumFramesPerSlice,
+                        kAudioUnitScope_Global,
+                        0,
+                    );
+                }
             }
             Prop::SetRenderCallback => {
                 let callback = take!(RenderCallbackStruct);

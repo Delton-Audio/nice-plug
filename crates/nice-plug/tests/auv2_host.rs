@@ -32,6 +32,8 @@ use objc2_audio_toolbox::{
 };
 // DELTON FORK DELTA: au-2
 use objc2_audio_toolbox::{kAudioUnitErr_InvalidProperty, kAudioUnitProperty_CocoaUI};
+// DELTON FORK DELTA: au-3
+use objc2_audio_toolbox::{AudioUnit, AudioUnitAddPropertyListener};
 use objc2_core_audio_types::{
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
     kAudioFormatLinearPCM, AudioBuffer, AudioBufferList, AudioStreamBasicDescription,
@@ -51,6 +53,16 @@ struct TestGainParams {
     mute: BoolParam,
     #[id = "mode"]
     mode: IntParam,
+    // DELTON FORK DELTA: au-3, an enum is the AU menu; an integer no longer is
+    #[id = "shape"]
+    shape: EnumParam<Shape>,
+}
+
+#[derive(Enum, PartialEq)]
+enum Shape {
+    Sine,
+    Square,
+    Saw,
 }
 
 impl Default for TestGainParams {
@@ -59,6 +71,7 @@ impl Default for TestGainParams {
             gain: FloatParam::new("Gain", 1.0, FloatRange::Linear { min: 0.0, max: 2.0 }),
             mute: BoolParam::new("Mute", false),
             mode: IntParam::new("Mode", 0, IntRange::Linear { min: 0, max: 3 }),
+            shape: EnumParam::new("Shape", Shape::Sine),
         }
     }
 }
@@ -450,9 +463,10 @@ fn parameter_info() {
     let gain_id = param_id("gain");
     let mute_id = param_id("mute");
     let mode_id = param_id("mode");
+    let shape_id = param_id("shape");
     assert_eq!(gain_id, 3165055);
 
-    // ParameterList: three ids
+    // ParameterList: four ids
     let mut size = 0u32;
     let mut writable = 0u8;
     let status = unsafe {
@@ -466,8 +480,8 @@ fn parameter_info() {
         )
     };
     assert_eq!(status, 0);
-    assert_eq!(size, 12);
-    let mut ids = [0u32; 3];
+    assert_eq!(size, 16);
+    let mut ids = [0u32; 4];
     let mut io_size = size;
     let status = unsafe {
         AudioUnitGetProperty(
@@ -480,7 +494,7 @@ fn parameter_info() {
         )
     };
     assert_eq!(status, 0);
-    for id in [gain_id, mute_id, mode_id] {
+    for id in [gain_id, mute_id, mode_id, shape_id] {
         assert!(ids.contains(&id), "{id} missing from {ids:?}");
     }
 
@@ -506,22 +520,36 @@ fn parameter_info() {
         .flags
         .contains(AudioUnitParameterOptions::Flag_HasCFNameString));
 
+    // An integer is a stepped generic value with one string at a time, never a list
     let mode = info(mode_id);
-    assert_eq!(mode.unit, AudioUnitParameterUnit::Indexed);
+    assert_eq!(mode.unit, AudioUnitParameterUnit::Generic);
     assert_eq!(mode.maxValue, 3.0);
-
-    let mute = info(mute_id);
-    assert_eq!(mute.unit, AudioUnitParameterUnit::Boolean);
-
-    // The names of an indexed parameter's values
-    let (status, strings) = unit.get::<*const c_void>(
+    assert!(mode
+        .flags
+        .contains(AudioUnitParameterOptions::Flag_ValuesHaveStrings));
+    let (status, _) = unit.get::<*const c_void>(
         kAudioUnitProperty_ParameterValueStrings,
         kAudioUnitScope_Global,
         mode_id,
     );
+    assert_eq!(status, kAudioUnitErr_InvalidProperty);
+
+    let shape = info(shape_id);
+    assert_eq!(shape.unit, AudioUnitParameterUnit::Indexed);
+    assert_eq!(shape.maxValue, 2.0);
+
+    let mute = info(mute_id);
+    assert_eq!(mute.unit, AudioUnitParameterUnit::Boolean);
+
+    // The names of an enum's values: the host's menu
+    let (status, strings) = unit.get::<*const c_void>(
+        kAudioUnitProperty_ParameterValueStrings,
+        kAudioUnitScope_Global,
+        shape_id,
+    );
     assert_eq!(status, 0);
     let strings = unsafe { CFRetained::from_raw(NonNull::new(strings as *mut CFArray).unwrap()) };
-    assert_eq!(strings.len(), 4);
+    assert_eq!(strings.len(), 3);
 
     // The host shows our text for a continuous value
     let mut value = 0.25f32;
@@ -715,6 +743,52 @@ fn mono_layout() {
     let samples = list.samples();
     assert_eq!(samples.len(), 256);
     assert!(samples.iter().all(|&sample| sample == 0.5), "{samples:?}");
+}
+
+// DELTON FORK DELTA: au-3, auval fails a unit that does not report a new MaximumFramesPerSlice
+static MAX_FRAMES_CHANGES: AtomicU32 = AtomicU32::new(0);
+
+/// Counts MaximumFramesPerSlice notifications on the global element; never panics (it is called
+/// from inside AudioToolbox).
+unsafe extern "C-unwind" fn property_changed(
+    refcon: NonNull<c_void>,
+    _unit: AudioUnit,
+    id: u32,
+    scope: u32,
+    element: u32,
+) {
+    if (id, scope, element)
+        == (
+            kAudioUnitProperty_MaximumFramesPerSlice,
+            kAudioUnitScope_Global,
+            0,
+        )
+    {
+        unsafe { &*(refcon.as_ptr() as *const AtomicU32) }.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn max_frames_change_notifies_listeners() {
+    let unit = Unit::new();
+    let refcon = &MAX_FRAMES_CHANGES as *const AtomicU32 as *mut c_void;
+    let status = unsafe {
+        AudioUnitAddPropertyListener(
+            unit.0,
+            kAudioUnitProperty_MaximumFramesPerSlice,
+            Some(property_changed),
+            refcon,
+        )
+    };
+    assert_eq!(status, 0);
+
+    assert_eq!(unit.set_max_frames(1024), 0);
+    assert_eq!(MAX_FRAMES_CHANGES.load(Ordering::SeqCst), 1);
+    // The same value again is not a change
+    assert_eq!(unit.set_max_frames(1024), 0);
+    assert_eq!(MAX_FRAMES_CHANGES.load(Ordering::SeqCst), 1);
+    assert_eq!(unit.set_max_frames(256), 0);
+    assert_eq!(MAX_FRAMES_CHANGES.load(Ordering::SeqCst), 2);
 }
 
 static NOTIFY_COUNT: AtomicU32 = AtomicU32::new(0);

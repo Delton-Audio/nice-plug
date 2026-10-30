@@ -34,8 +34,13 @@ pub const FLAG_IS_WRITABLE: u32 = 1 << 31;
 pub enum AuParamKind {
     /// A float parameter: the AU value is the normalized value, 0.0 to 1.0.
     Continuous,
-    /// An integer or enum parameter: the AU value is the step number, 0 to `steps`.
+    /// An enum parameter: the AU value is the step number, 0 to `steps`, and the host gets the
+    /// whole list of value strings (a menu).
     Indexed { steps: u32 },
+    // DELTON FORK DELTA: au-3, an integer is not a menu (one had 1048513 value strings)
+    /// An integer parameter: the AU value is the step number, 0 to `steps`, and the host asks for
+    /// one value's string at a time.
+    Stepped { steps: u32 },
     /// A boolean parameter: 0.0 or 1.0.
     Boolean,
 }
@@ -55,7 +60,7 @@ pub struct AuParamEntry {
     pub kind: AuParamKind,
     /// 0.0 always.
     pub min: f32,
-    /// Continuous 1.0; Indexed steps as f32; Boolean 1.0.
+    /// Continuous 1.0; Indexed and Stepped steps as f32; Boolean 1.0.
     pub max: f32,
     /// `au_from_normalized(kind, default_normalized_value)`.
     pub default: f32,
@@ -91,7 +96,10 @@ impl AuParamTable {
             let (kind, name, unit_label, default_normalized, param_flags) = unsafe {
                 let kind = match ptr {
                     ParamPtr::BoolParam(_) => AuParamKind::Boolean,
-                    ParamPtr::IntParam(_) | ParamPtr::EnumParam(_) => AuParamKind::Indexed {
+                    ParamPtr::IntParam(_) => AuParamKind::Stepped {
+                        steps: ptr.step_count().unwrap_or(0) as u32,
+                    },
+                    ParamPtr::EnumParam(_) => AuParamKind::Indexed {
                         steps: ptr.step_count().unwrap_or(0) as u32,
                     },
                     ParamPtr::FloatParam(_) => AuParamKind::Continuous,
@@ -120,7 +128,7 @@ impl AuParamTable {
             };
 
             let mut flags = FLAG_IS_READABLE | FLAG_IS_WRITABLE | FLAG_HAS_CF_NAME_STRING;
-            if kind == AuParamKind::Continuous {
+            if matches!(kind, AuParamKind::Continuous | AuParamKind::Stepped { .. }) {
                 flags |= FLAG_VALUES_HAVE_STRINGS;
             }
             if param_flags.contains(ParamFlags::NON_AUTOMATABLE) {
@@ -132,7 +140,7 @@ impl AuParamTable {
 
             let max = match kind {
                 AuParamKind::Continuous | AuParamKind::Boolean => 1.0,
-                AuParamKind::Indexed { steps } => steps as f32,
+                AuParamKind::Indexed { steps } | AuParamKind::Stepped { steps } => steps as f32,
             };
 
             let id = hash_param_id(string_id);
@@ -194,7 +202,9 @@ impl AuParamTable {
 pub fn au_from_normalized(kind: AuParamKind, normalized: f32) -> f32 {
     match kind {
         AuParamKind::Continuous => normalized,
-        AuParamKind::Indexed { steps } => (normalized * steps as f32).round(),
+        AuParamKind::Indexed { steps } | AuParamKind::Stepped { steps } => {
+            (normalized * steps as f32).round()
+        }
         AuParamKind::Boolean => {
             if normalized >= 0.5 {
                 1.0
@@ -211,7 +221,7 @@ pub fn normalized_from_au(kind: AuParamKind, value: f32) -> f32 {
     let value = if value.is_nan() { 0.0 } else { value };
     match kind {
         AuParamKind::Continuous => value.clamp(0.0, 1.0),
-        AuParamKind::Indexed { steps } => {
+        AuParamKind::Indexed { steps } | AuParamKind::Stepped { steps } => {
             if steps == 0 {
                 0.0
             } else {
@@ -231,8 +241,9 @@ pub fn normalized_from_au(kind: AuParamKind, value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nice_plug_core::params::enums::Enum;
     use nice_plug_core::params::range::{FloatRange, IntRange};
-    use nice_plug_core::params::{BoolParam, FloatParam, IntParam, Param};
+    use nice_plug_core::params::{BoolParam, EnumParam, FloatParam, IntParam, Param};
 
     #[test]
     fn table_from_a_hand_built_param_map() {
@@ -271,7 +282,8 @@ mod tests {
         assert_eq!(gain_entry.name, "Gain");
 
         let mode_entry = table.get(hash_param_id("mode")).unwrap();
-        assert_eq!(mode_entry.kind, AuParamKind::Indexed { steps: 3 });
+        assert_eq!(mode_entry.kind, AuParamKind::Stepped { steps: 3 });
+        assert_ne!(mode_entry.flags & FLAG_VALUES_HAVE_STRINGS, 0);
         assert_eq!(mode_entry.max, 3.0);
         assert_eq!(mode_entry.default, 2.0);
         assert_eq!(mode_entry.clump, Some(1));
@@ -293,6 +305,65 @@ mod tests {
 
         assert_eq!(table.bypass_id(), Some(hash_param_id("byp")));
         assert_eq!(table.get(0xDEAD_BEEF), None);
+    }
+
+    #[derive(PartialEq)]
+    enum Shape {
+        Sine,
+        Square,
+        Saw,
+    }
+
+    impl Enum for Shape {
+        fn variants() -> &'static [&'static str] {
+            &["Sine", "Square", "Saw"]
+        }
+
+        fn ids() -> Option<&'static [&'static str]> {
+            None
+        }
+
+        fn to_index(self) -> usize {
+            self as usize
+        }
+
+        fn from_index(index: usize) -> Self {
+            match index {
+                1 => Shape::Square,
+                2 => Shape::Saw,
+                _ => Shape::Sine,
+            }
+        }
+    }
+
+    // An enum is a menu (the whole list of value strings); an integer is not, however wide
+    #[test]
+    fn enums_are_menus_and_integers_are_stepped() {
+        let shape = EnumParam::new("Shape", Shape::Saw);
+        let trials = IntParam::new(
+            "Trials",
+            49_088,
+            IntRange::Linear {
+                min: 64,
+                max: 1_048_576,
+            },
+        );
+        let map = vec![
+            ("shape".to_string(), shape.as_ptr(), String::new()),
+            ("trials".to_string(), trials.as_ptr(), String::new()),
+        ];
+        let table = unsafe { AuParamTable::build(&map) };
+
+        let shape_entry = table.get(hash_param_id("shape")).unwrap();
+        assert_eq!(shape_entry.kind, AuParamKind::Indexed { steps: 2 });
+        assert_eq!(shape_entry.flags & FLAG_VALUES_HAVE_STRINGS, 0);
+        assert_eq!((shape_entry.max, shape_entry.default), (2.0, 2.0));
+
+        let trials_entry = table.get(hash_param_id("trials")).unwrap();
+        assert_eq!(trials_entry.kind, AuParamKind::Stepped { steps: 1_048_512 });
+        assert_ne!(trials_entry.flags & FLAG_VALUES_HAVE_STRINGS, 0);
+        assert_eq!(trials_entry.max, 1_048_512.0);
+        assert_eq!(trials_entry.default, 49_024.0);
     }
 
     #[test]
@@ -349,6 +420,10 @@ mod tests {
             normalized_from_au(AuParamKind::Continuous, f32::INFINITY),
             1.0
         );
+        let stepped = AuParamKind::Stepped { steps: 3 };
+        assert_eq!(au_from_normalized(stepped, 0.5), 2.0);
+        assert_eq!(normalized_from_au(stepped, 2.0), 2.0 / 3.0);
+        assert_eq!(normalized_from_au(stepped, 7.0), 1.0);
     }
 
     // The flag values are the AU header's; check them against the generated bindings.
