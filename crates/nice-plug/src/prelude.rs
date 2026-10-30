@@ -24,8 +24,10 @@ pub use crate::context::PluginApi;
 pub use crate::context::activate::ActivateContext;
 #[cfg(feature = "editor")]
 pub use crate::context::gui::{AsyncExecutor, GuiContextInner, ParamSetter};
-// DELTON FORK DELTA
-pub use crate::context::process::{ParamAutomationPoint, ProcessContext, Transport};
+// DELTON FORK DELTA: au-4a
+pub use crate::context::process::{
+    AudioWorkgroup, ParamAutomationPoint, ProcessContext, Transport,
+};
 pub use crate::context::remote_controls::{
     RemoteControlsContext, RemoteControlsPage, RemoteControlsSection,
 };

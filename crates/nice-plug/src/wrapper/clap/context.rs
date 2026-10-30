@@ -10,7 +10,7 @@ use nice_plug_core::context::PluginApi;
 use nice_plug_core::context::activate::ActivateContext;
 // DELTON FORK DELTA
 use nice_plug_core::context::process::{
-    ParamAutomationPoint, ProcessContext, SendEventError, Transport,
+    AudioWorkgroup, ParamAutomationPoint, ProcessContext, SendEventError, Transport,
 };
 use nice_plug_core::context::remote_controls::{
     RemoteControlsContext, RemoteControlsPage, RemoteControlsSection,
@@ -538,6 +538,12 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
 
     fn set_current_voice_capacity(&self, capacity: u32) {
         self.wrapper.set_current_voice_capacity(capacity)
+    }
+
+    // DELTON FORK DELTA: au-4a
+    fn audio_workgroup(&self) -> Option<AudioWorkgroup> {
+        // CLAP has no audio workgroup
+        None
     }
 
     fn request_restart(&self) {

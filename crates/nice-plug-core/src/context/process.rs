@@ -1,5 +1,8 @@
 //! A context passed during the process function.
 
+use std::ffi::c_void;
+use std::ptr::NonNull;
+
 use crate::{
     // DELTON FORK DELTA
     audio_setup::ProcessMode,
@@ -10,6 +13,35 @@ use crate::{
 };
 
 use super::PluginApi;
+
+// DELTON FORK DELTA: au-4a
+/// The host's audio workgroup for this plugin instance: a macOS `os_workgroup_t`. Only Audio Unit
+/// hosts on macOS 11 and later provide one. Threads the plugin runs realtime work on should join
+/// it (`os_workgroup_join`), so the OS schedules them with the host's render thread.
+///
+/// The pointer stays valid until the plugin instance is dropped: the wrapper retains every
+/// workgroup it hands out until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioWorkgroup(NonNull<c_void>);
+
+// SAFETY: An `os_workgroup_t` is a reference-counted OS object that may be used from any thread.
+unsafe impl Send for AudioWorkgroup {}
+// SAFETY: See above.
+unsafe impl Sync for AudioWorkgroup {}
+
+impl AudioWorkgroup {
+    /// # Safety
+    ///
+    /// `workgroup` must be an `os_workgroup_t` that stays valid as described on the type.
+    pub unsafe fn from_raw(workgroup: NonNull<c_void>) -> Self {
+        Self(workgroup)
+    }
+
+    /// The `os_workgroup_t`.
+    pub fn as_ptr(self) -> *mut c_void {
+        self.0.as_ptr()
+    }
+}
 
 /// Contains both context data and callbacks the plugin can use during processing. Most notably this
 /// is how a plugin sends and receives note events, gets transport information, and accesses
@@ -132,6 +164,11 @@ pub trait ProcessContext<P: Plugin> {
     /// allows the host to better optimize polyphonic modulation, or to switch to strictly monophonic
     /// modulation when dropping the capacity down to 1.
     fn set_current_voice_capacity(&self, capacity: u32);
+
+    // DELTON FORK DELTA: au-4a
+    /// The host's audio workgroup, when the host provides one (Audio Unit hosts on macOS 11 and
+    /// later). `None` in every other format. See [`AudioWorkgroup`].
+    fn audio_workgroup(&self) -> Option<AudioWorkgroup>;
 
     // TODO: Add this, this works similar to [GuiContext::set_parameter] but it adds the parameter
     //       change to a queue (or directly to the VST3 plugin's parameter output queues) instead of

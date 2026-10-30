@@ -8,7 +8,7 @@ use nice_plug_core::context::activate::ActivateContext;
 #[cfg(feature = "editor")]
 use nice_plug_core::context::gui::GuiContextInner;
 use nice_plug_core::context::process::{
-    ParamAutomationPoint, ProcessContext, SendEventError, Transport,
+    AudioWorkgroup, ParamAutomationPoint, ProcessContext, SendEventError, Transport,
 };
 use nice_plug_core::context::PluginApi;
 use nice_plug_core::midi::PluginNoteEvent;
@@ -120,6 +120,11 @@ impl<P: AuPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
 
     fn set_current_voice_capacity(&self, _capacity: u32) {
         // This is only supported by CLAP
+    }
+
+    // DELTON FORK DELTA: au-4a
+    fn audio_workgroup(&self) -> Option<AudioWorkgroup> {
+        self.inner.workgroup.current()
     }
 
     fn request_restart(&self) {

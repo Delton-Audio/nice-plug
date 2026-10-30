@@ -44,7 +44,7 @@ standalone-asio = ["standalone", "cpal/asio"]
 # Enables the `nice_export_vst3!()` macro. Enabled by default.
 vst3 = ["dep:vst3", "dep:widestring"]
 # DELTON FORK DELTA (au-1): enables the `nice_export_auv2!()` macro and the Audio Unit v2 wrapper.
-auv2 = ["dep:objc2-audio-toolbox", "dep:objc2-core-audio-types", "dep:objc2-core-foundation"]
+auv2 = ["dep:objc2-audio-toolbox", "dep:objc2-core-audio-types", "dep:objc2-core-foundation", "dep:block2"]
 # Add adapters to the Buffer object for reading the channel data to and from
 # `std::simd` vectors. Requires a nightly compiler.
 simd = ["nice-plug-core/simd"]
@@ -131,6 +131,8 @@ libc = "0.2.124"
 objc2 = "0.6.4"
 core-foundation = "0.10.1"
 # DELTON FORK DELTA (au-1): bindings for the AUv2 wrapper (RULES D14 exception, Sam 2026-10-29)
+# DELTON FORK DELTA (au-4a): the render-context observer is an Objective-C block
+block2 = { version = "0.6.2", optional = true }
 objc2-audio-toolbox = { version = "0.3.2", optional = true, default-features = false, features = [
   "std", "AUComponent", "AudioComponent", "AudioUnitProperties", "AudioUnitParameters",
   "AudioUnitUtilities", "objc2-core-audio-types", "objc2-core-foundation", "bitflags",

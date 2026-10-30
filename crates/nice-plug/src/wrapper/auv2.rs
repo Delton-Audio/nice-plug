@@ -9,6 +9,8 @@ pub(crate) mod param_table;
 pub(crate) mod render_check;
 // DELTON FORK DELTA: au-2
 pub(crate) mod view_names;
+// DELTON FORK DELTA: au-4a
+pub(crate) mod workgroup;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod buffers;

@@ -8,7 +8,7 @@
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, Once};
 
 use nice_plug::prelude::*;
@@ -34,6 +34,10 @@ use objc2_audio_toolbox::{
 use objc2_audio_toolbox::{kAudioUnitErr_InvalidProperty, kAudioUnitProperty_CocoaUI};
 // DELTON FORK DELTA: au-3
 use objc2_audio_toolbox::{AudioUnit, AudioUnitAddPropertyListener};
+// DELTON FORK DELTA: au-4a
+use objc2_audio_toolbox::{
+    kAudioUnitErr_PropertyNotWritable, kAudioUnitProperty_RenderContextObserver,
+};
 use objc2_core_audio_types::{
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
     kAudioFormatLinearPCM, AudioBuffer, AudioBufferList, AudioStreamBasicDescription,
@@ -75,6 +79,13 @@ impl Default for TestGainParams {
         }
     }
 }
+
+// DELTON FORK DELTA: au-4a
+/// `mode` at this value marks the unit of the workgroup test, the only one whose `process`
+/// records (no other test sets it; libtest runs the rendering tests in parallel).
+const RECORD_WORKGROUP_MODE: i32 = 3;
+// DELTON FORK DELTA: au-4a
+static SEEN_WORKGROUP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 struct TestGain {
     params: Arc<TestGainParams>,
@@ -130,8 +141,19 @@ impl Plugin for TestGain {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        // DELTON FORK DELTA: au-4a
+        // Only the workgroup test's unit records: libtest runs the other rendering tests in parallel
+        if self.params.mode.value() == RECORD_WORKGROUP_MODE {
+            SEEN_WORKGROUP.store(
+                context
+                    .audio_workgroup()
+                    .map_or(ptr::null_mut(), |w| w.as_ptr()),
+                Ordering::SeqCst,
+            );
+        }
+
         // The plain, unsmoothed values: the test compares exact samples
         let gain = self.params.gain.value();
         let mute = self.params.mute.value();
@@ -831,6 +853,114 @@ fn render_notify() {
     let mut list = TestList::new(2, 512, false);
     assert_eq!(unit.render(512, 0, &mut list), 0);
     assert_eq!(NOTIFY_COUNT.load(Ordering::SeqCst), 2);
+}
+
+// DELTON FORK DELTA: au-4a
+// os_workgroup_interval_create (macOS 11): a process-made workgroup to hand the observer
+unsafe extern "C" {
+    fn os_workgroup_interval_create(
+        name: *const std::ffi::c_char,
+        clock: u32,
+        attr: *const c_void,
+    ) -> *mut c_void;
+    fn os_release(object: *mut c_void);
+}
+const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
+
+// DELTON FORK DELTA: au-4a
+#[repr(C)]
+struct RenderContext {
+    workgroup: *mut c_void,
+    reserved: [u32; 6],
+}
+
+// DELTON FORK DELTA: au-4a
+#[test]
+fn render_context_observer_hands_the_workgroup_to_process() {
+    let unit = Unit::new();
+    unit.set_parameter("mode", RECORD_WORKGROUP_MODE as f32);
+    unit.set_format(2, 44100.0);
+    assert_eq!(unit.set_max_frames(512), 0);
+    unit.set_input_callback();
+    assert_eq!(unit.initialize(), 0);
+
+    let mut size = 0u32;
+    let mut writable = 1u8;
+    let status = unsafe {
+        AudioUnitGetPropertyInfo(
+            unit.0,
+            kAudioUnitProperty_RenderContextObserver,
+            kAudioUnitScope_Global,
+            0,
+            &mut size,
+            &mut writable,
+        )
+    };
+    assert_eq!(status, 0);
+    assert_eq!(size as usize, size_of::<*const c_void>());
+    assert_eq!(writable, 0);
+
+    let (status, block) = unit.get::<*const c_void>(
+        kAudioUnitProperty_RenderContextObserver,
+        kAudioUnitScope_Global,
+        0,
+    );
+    assert_eq!(status, 0);
+    assert!(!block.is_null());
+    // SAFETY: The property returns a pointer to a live block, which lives as long as the unit. Its
+    // argument is a pointer to the render context.
+    let block = unsafe { &*(block as *const block2::Block<dyn Fn(*const c_void)>) };
+
+    let wg = unsafe {
+        os_workgroup_interval_create(
+            c"au-4a test".as_ptr(),
+            OS_CLOCK_MACH_ABSOLUTE_TIME,
+            ptr::null(),
+        )
+    };
+    assert!(!wg.is_null());
+
+    // Render one block and return the workgroup `process` saw
+    let render = || {
+        let mut list = TestList::new(2, 512, false);
+        assert_eq!(unit.render(512, 0, &mut list), 0);
+        SEEN_WORKGROUP.load(Ordering::SeqCst)
+    };
+
+    let context = RenderContext {
+        workgroup: wg,
+        reserved: [0; 6],
+    };
+    block.call((&context as *const RenderContext as *const c_void,));
+    assert_eq!(render(), wg);
+
+    // The host switches the instance to no workgroup, by a context without one
+    let empty = RenderContext {
+        workgroup: ptr::null_mut(),
+        reserved: [0; 6],
+    };
+    block.call((&empty as *const RenderContext as *const c_void,));
+    assert!(render().is_null());
+
+    // and by no context at all
+    block.call((&context as *const RenderContext as *const c_void,));
+    assert_eq!(render(), wg);
+    block.call((ptr::null(),));
+    assert!(render().is_null());
+
+    // The observer is read-only
+    let status = unit.set(
+        kAudioUnitProperty_RenderContextObserver,
+        kAudioUnitScope_Global,
+        0,
+        &block,
+    );
+    assert_eq!(status, kAudioUnitErr_PropertyNotWritable);
+
+    // The wrapper releases its reference when the unit closes (nothing copied the block, so it
+    // goes with the unit); this one is the test's own
+    drop(unit);
+    unsafe { os_release(wg) };
 }
 
 // A property listener on `Latency` is called from the wrapper's event loop on the main thread,

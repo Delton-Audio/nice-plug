@@ -7,7 +7,9 @@ use nice_plug_core::{
         PluginApi,
         activate::ActivateContext,
         // DELTON FORK DELTA
-        process::{ParamAutomationPoint, ProcessContext, SendEventError, Transport},
+        process::{
+            AudioWorkgroup, ParamAutomationPoint, ProcessContext, SendEventError, Transport,
+        },
     },
     midi::{Channel, Key, MidiConfig, NoteEvent, PluginNoteEvent},
 };
@@ -393,6 +395,12 @@ impl<P: Vst3Plugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
 
     fn set_current_voice_capacity(&self, _capacity: u32) {
         // This is only supported by CLAP
+    }
+
+    // DELTON FORK DELTA: au-4a
+    fn audio_workgroup(&self) -> Option<AudioWorkgroup> {
+        // VST3 has no audio workgroup
+        None
     }
 
     fn request_restart(&self) {

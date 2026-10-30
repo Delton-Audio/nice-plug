@@ -23,20 +23,21 @@ pub(crate) use objc2_audio_toolbox::{
     kAudioUnitProperty_ParameterClumpName, kAudioUnitProperty_ParameterInfo,
     kAudioUnitProperty_ParameterList, kAudioUnitProperty_ParameterStringFromValue,
     kAudioUnitProperty_ParameterValueFromString, kAudioUnitProperty_ParameterValueStrings,
-    kAudioUnitProperty_PresentPreset, kAudioUnitProperty_RenderQuality,
-    kAudioUnitProperty_SampleRate, kAudioUnitProperty_SetRenderCallback,
-    kAudioUnitProperty_ShouldAllocateBuffer, kAudioUnitProperty_StreamFormat,
-    kAudioUnitProperty_SupportedNumChannels, kAudioUnitProperty_TailTime,
-    kAudioUnitRemovePropertyListenerSelect, kAudioUnitRemovePropertyListenerWithUserDataSelect,
-    kAudioUnitRemoveRenderNotifySelect, kAudioUnitRenderSelect, kAudioUnitResetSelect,
-    kAudioUnitScheduleParametersSelect, kAudioUnitScope_Global, kAudioUnitScope_Input,
-    kAudioUnitScope_Output, kAudioUnitSetParameterSelect, kAudioUnitSetPropertySelect,
-    kAudioUnitUninitializeSelect, kRenderQuality_Max, AUChannelInfo, AUParameterEventType,
-    AUParameterListenerNotify, AUPreset, AudioComponentInstance, AudioComponentMethod,
-    AudioComponentPlugInInterface, AudioUnit, AudioUnitConnection, AudioUnitElement,
-    AudioUnitParameter, AudioUnitParameterID, AudioUnitParameterInfo, AudioUnitParameterNameInfo,
-    AudioUnitParameterOptions, AudioUnitParameterUnit, AudioUnitPropertyID, AudioUnitRender,
-    AudioUnitRenderActionFlags, AudioUnitScope, HostCallbackInfo, HostCallback_GetBeatAndTempo,
+    kAudioUnitProperty_PresentPreset, kAudioUnitProperty_RenderContextObserver,
+    kAudioUnitProperty_RenderQuality, kAudioUnitProperty_SampleRate,
+    kAudioUnitProperty_SetRenderCallback, kAudioUnitProperty_ShouldAllocateBuffer,
+    kAudioUnitProperty_StreamFormat, kAudioUnitProperty_SupportedNumChannels,
+    kAudioUnitProperty_TailTime, kAudioUnitRemovePropertyListenerSelect,
+    kAudioUnitRemovePropertyListenerWithUserDataSelect, kAudioUnitRemoveRenderNotifySelect,
+    kAudioUnitRenderSelect, kAudioUnitResetSelect, kAudioUnitScheduleParametersSelect,
+    kAudioUnitScope_Global, kAudioUnitScope_Input, kAudioUnitScope_Output,
+    kAudioUnitSetParameterSelect, kAudioUnitSetPropertySelect, kAudioUnitUninitializeSelect,
+    kRenderQuality_Max, AUChannelInfo, AUParameterEventType, AUParameterListenerNotify, AUPreset,
+    AudioComponentInstance, AudioComponentMethod, AudioComponentPlugInInterface, AudioUnit,
+    AudioUnitConnection, AudioUnitElement, AudioUnitParameter, AudioUnitParameterID,
+    AudioUnitParameterInfo, AudioUnitParameterNameInfo, AudioUnitParameterOptions,
+    AudioUnitParameterUnit, AudioUnitPropertyID, AudioUnitRender, AudioUnitRenderActionFlags,
+    AudioUnitScope, HostCallbackInfo, HostCallback_GetBeatAndTempo,
     HostCallback_GetMusicalTimeLocation, HostCallback_GetTransportState2,
 };
 pub(crate) use objc2_core_audio_types::{
@@ -47,6 +48,21 @@ pub(crate) use objc2_core_audio_types::{
 pub(crate) use objc2_core_foundation::{
     CFArray, CFData, CFDictionary, CFMutableDictionary, CFNumber, CFRetained, CFString, CFType,
 };
+
+// DELTON FORK DELTA: au-4a. `AudioUnitProperties.h`; not in the generated crate.
+/// `AudioUnitRenderContext`: what the OS passes the render-context observer block.
+#[repr(C)]
+pub(crate) struct AudioUnitRenderContext {
+    pub workgroup: *mut c_void,
+    pub reserved: [u32; 6],
+}
+
+// DELTON FORK DELTA: au-4a
+// The `os_object` reference count functions (libSystem, macOS 10.12+).
+unsafe extern "C" {
+    pub(crate) fn os_retain(object: *mut c_void) -> *mut c_void;
+    pub(crate) fn os_release(object: *mut c_void);
+}
 
 /// Apple's `OSStatus`.
 pub(crate) type OSStatus = i32;

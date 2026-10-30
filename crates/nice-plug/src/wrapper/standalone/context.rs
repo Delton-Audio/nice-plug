@@ -1,6 +1,6 @@
 use nice_plug_core::context::PluginApi;
 use nice_plug_core::context::activate::ActivateContext;
-use nice_plug_core::context::process::{ProcessContext, SendEventError, Transport};
+use nice_plug_core::context::process::{AudioWorkgroup, ProcessContext, SendEventError, Transport};
 use nice_plug_core::midi::PluginNoteEvent;
 use nice_plug_core::plugin::Plugin;
 
@@ -99,6 +99,12 @@ impl<P: Plugin, B: Backend<P>> ProcessContext<P> for WrapperProcessContext<'_, P
 
     fn set_current_voice_capacity(&self, _capacity: u32) {
         // This is only supported by CLAP
+    }
+
+    // DELTON FORK DELTA: au-4a
+    fn audio_workgroup(&self) -> Option<AudioWorkgroup> {
+        // The standalone backends do not provide an audio workgroup
+        None
     }
 
     fn request_restart(&self) {

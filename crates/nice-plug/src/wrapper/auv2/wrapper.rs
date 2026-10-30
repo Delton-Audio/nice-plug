@@ -6,6 +6,7 @@
 //! CoreFoundation; everything it shares with the other threads is atomic or an `AtomicCell`.
 
 use atomic_refcell::AtomicRefCell;
+use block2::RcBlock;
 use crossbeam::atomic::AtomicCell;
 use crossbeam::channel;
 use crossbeam::queue::ArrayQueue;
@@ -53,6 +54,8 @@ use super::param_table::{au_from_normalized, normalized_from_au, AuParamKind, Au
 use super::render_check::{check_render, RenderCheck, RenderError};
 use super::state;
 use super::sys::*;
+// DELTON FORK DELTA: au-4a
+use super::workgroup::{OsRetain, WorkgroupSlot};
 // DELTON FORK DELTA: au-2
 #[cfg(feature = "editor")]
 use super::view;
@@ -237,6 +240,18 @@ impl RenderNotifyList {
     }
 }
 
+// DELTON FORK DELTA: au-4a
+/// The render-context observer block, kept alive by the wrapper.
+// The argument is a `*const c_void` (cast to `AudioUnitRenderContext` in the closure): objc2 only
+// lets a block take a pointer to a type that has an Objective-C encoding.
+struct ObserverBlock(RcBlock<dyn Fn(*const c_void)>);
+
+// SAFETY: A block is immutable once made and its reference count is atomic; this one's closure
+// owns only an `Arc` of atomics. The host calls it from its render thread.
+unsafe impl Send for ObserverBlock {}
+// SAFETY: See above.
+unsafe impl Sync for ObserverBlock {}
+
 /// Write a property value into the host's buffer.
 ///
 /// # Safety
@@ -278,6 +293,8 @@ enum Prop {
     RenderQuality,
     OfflineRender,
     Private,
+    // DELTON FORK DELTA: au-4a
+    RenderContextObserver,
     // DELTON FORK DELTA: au-2
     #[cfg(feature = "editor")]
     CocoaUI,
@@ -329,6 +346,8 @@ impl Prop {
             kAudioUnitProperty_RenderQuality => Prop::RenderQuality,
             kAudioUnitProperty_OfflineRender => Prop::OfflineRender,
             PRIVATE_WRAPPER_PROPERTY => Prop::Private,
+            // DELTON FORK DELTA: au-4a
+            kAudioUnitProperty_RenderContextObserver => Prop::RenderContextObserver,
             // DELTON FORK DELTA: au-2
             #[cfg(feature = "editor")]
             kAudioUnitProperty_CocoaUI => Prop::CocoaUI,
@@ -446,6 +465,12 @@ pub(crate) struct Wrapper<P: AuPlugin> {
     input_sources: Vec<AtomicCell<InputSource>>,
     host_callbacks: AtomicCell<HostCallbacks>,
     property_listeners: Mutex<Vec<PropertyListener>>,
+    // DELTON FORK DELTA: au-4a
+    /// The host's audio workgroup for this instance, set from the render-context observer.
+    pub(crate) workgroup: Arc<WorkgroupSlot<OsRetain>>,
+    // DELTON FORK DELTA: au-4a
+    /// The block the host gets from `kAudioUnitProperty_RenderContextObserver`.
+    render_context_observer: ObserverBlock,
     render_notifies: RenderNotifyList,
 
     /// Allocated at Initialize.
@@ -560,6 +585,20 @@ impl<P: AuPlugin> Wrapper<P> {
             P::INPUT_EVENT_CAPACITY
         };
 
+        // DELTON FORK DELTA: au-4a
+        let workgroup = Arc::new(WorkgroupSlot::new());
+        let observer_slot = Arc::clone(&workgroup);
+        let render_context_observer = ObserverBlock(RcBlock::new(move |context: *const c_void| {
+            let context = context.cast::<AudioUnitRenderContext>();
+            // SAFETY: The OS passes a context valid for this call, or null.
+            let workgroup = if context.is_null() {
+                ptr::null_mut()
+            } else {
+                unsafe { (*context).workgroup }
+            };
+            observer_slot.set(workgroup);
+        }));
+
         // DELTON FORK DELTA: au-2 (`this` is for the view factory)
         let wrapper = Arc::new_cyclic(|this| Self {
             unit: UnitHandle(unit),
@@ -601,6 +640,9 @@ impl<P: AuPlugin> Wrapper<P> {
 
             host_callbacks: AtomicCell::new(HostCallbacks::default()),
             property_listeners: Mutex::new(Vec::with_capacity(PROPERTY_LISTENER_CAPACITY)),
+            // DELTON FORK DELTA: au-4a
+            workgroup,
+            render_context_observer,
             render_notifies: RenderNotifyList::new(),
 
             // These are replaced at Initialize, when the channel counts are known
@@ -1264,6 +1306,8 @@ impl<P: AuPlugin> Wrapper<P> {
             Prop::MakeConnection => size_of::<AudioUnitConnection>(),
             Prop::HostCallbacks => size_of::<HostCallbackInfo>(),
             Prop::FactoryPresets | Prop::ElementName | Prop::Private => size_of::<*const c_void>(),
+            // DELTON FORK DELTA: au-4a
+            Prop::RenderContextObserver => size_of::<*const c_void>(),
             Prop::PresentPreset => size_of::<AUPreset>(),
             // DELTON FORK DELTA: au-2
             #[cfg(feature = "editor")]
@@ -1625,6 +1669,12 @@ impl<P: AuPlugin> Wrapper<P> {
                 put!((self.current_process_mode.load() == ProcessMode::Offline) as u32)
             }
             Prop::Private => put!(self as *const Self as *const c_void),
+            // DELTON FORK DELTA: au-4a
+            // The host copies the block (`Block_copy`), which retains it; our own reference lives as
+            // long as the wrapper, so the block outlives any host that never copies it.
+            Prop::RenderContextObserver => {
+                put!(RcBlock::as_ptr(&self.render_context_observer.0) as *const c_void)
+            }
             // DELTON FORK DELTA: au-2
             #[cfg(feature = "editor")]
             Prop::CocoaUI => match view::cocoa_view_info::<P>() {
@@ -1880,6 +1930,8 @@ impl<P: AuPlugin> Wrapper<P> {
             | Prop::FactoryPresets
             | Prop::ElementName
             | Prop::Private => return kAudioUnitErr_PropertyNotWritable,
+            // DELTON FORK DELTA: au-4a
+            Prop::RenderContextObserver => return kAudioUnitErr_PropertyNotWritable,
             // DELTON FORK DELTA: au-2
             #[cfg(feature = "editor")]
             Prop::CocoaUI => return kAudioUnitErr_PropertyNotWritable,
