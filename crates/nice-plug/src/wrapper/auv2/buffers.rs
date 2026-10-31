@@ -150,8 +150,9 @@ impl AuBuffers {
 
     /// Set up the output pointers from the host's buffer list. A null `mData` is set to our own
     /// channel buffer (the host reads the list back, which is legal in AU). Returns false if a
-    /// buffer the host did supply is smaller than `frames` samples. Aux output elements always get
-    /// our scratch buffers: au-1 does not support pulling them.
+    /// buffer the host did supply is smaller than `frames` samples. Aux output elements get our
+    /// storage; a plugin with aux outputs is rendered through `prepare_outputs_internal` instead
+    /// (au-4c).
     ///
     /// # Safety
     ///
@@ -190,6 +191,75 @@ impl AuBuffers {
             }
         }
 
+        true
+    }
+
+    // DELTON FORK DELTA: au-4c
+    /// Point EVERY output element at our own storage and zero its first `frames` samples. Used when
+    /// the plugin has aux outputs: the plugin renders all buses into our storage, then each render
+    /// call copies its bus out (`copy_output_to`).
+    pub fn prepare_outputs_internal(&mut self, frames: u32) {
+        let frames = frames as usize;
+        for (channels, slots) in self
+            .output_channels
+            .iter_mut()
+            .zip(self.output_pointers.iter_mut())
+        {
+            for (storage, slot) in channels.iter_mut().zip(slots.iter_mut()) {
+                let end = frames.min(storage.len());
+                storage[..end].fill(0.0);
+                *slot = storage.as_mut_ptr() as usize;
+            }
+        }
+    }
+
+    // DELTON FORK DELTA: au-4c
+    /// Hand output element `element`'s first `frames` samples to the host's list: a buffer whose
+    /// `mData` is null is pointed at our storage (legal in AU; the host reads the list back), any
+    /// other buffer gets a copy. Returns false when `element` does not exist, when the list has
+    /// fewer buffers than the element has channels, or when a host buffer is smaller than `frames`
+    /// samples.
+    ///
+    /// # Safety
+    ///
+    /// `list` must point to a valid `AudioBufferList`.
+    pub unsafe fn copy_output_to(
+        &mut self,
+        element: usize,
+        list: *mut AudioBufferList,
+        frames: u32,
+    ) -> bool {
+        let Some(channels) = self.output_channels.get_mut(element) else {
+            return false;
+        };
+        let needed = frames.saturating_mul(4);
+        // SAFETY: The caller guarantees `list` is valid.
+        let count = unsafe { (*list).mNumberBuffers } as usize;
+        if count < channels.len() {
+            return false;
+        }
+        // SAFETY: As above; the list has `count` buffers.
+        let first = unsafe { (&raw mut (*list).mBuffers) as *mut AudioBuffer };
+        for (i, storage) in channels.iter_mut().enumerate() {
+            // SAFETY: `i < channels.len() <= count`.
+            let buffer = unsafe { &mut *first.add(i) };
+            if buffer.mData.is_null() {
+                buffer.mData = storage.as_mut_ptr() as *mut c_void;
+                buffer.mDataByteSize = needed;
+            } else if buffer.mDataByteSize < needed {
+                return false;
+            } else {
+                // SAFETY: Our storage holds max_frames >= frames samples; the host buffer holds
+                // `needed` bytes; they never overlap (one is ours, one the host's).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        storage.as_ptr(),
+                        buffer.mData as *mut f32,
+                        frames as usize,
+                    )
+                };
+            }
+        }
         true
     }
 
@@ -280,5 +350,76 @@ mod tests {
             buffers.input_pointers[0][0],
             buffers.input_channels[0][0].as_ptr() as usize
         );
+    }
+
+    // DELTON FORK DELTA: au-4c
+    #[test]
+    fn internal_outputs_point_at_our_storage_and_are_zeroed() {
+        let mut buffers = AuBuffers::new(&[], &[2, 2], 16);
+        for channels in buffers.output_channels.iter_mut() {
+            for storage in channels.iter_mut() {
+                storage.fill(1.0);
+            }
+        }
+
+        buffers.prepare_outputs_internal(8);
+
+        for (channels, slots) in buffers
+            .output_channels
+            .iter()
+            .zip(buffers.output_pointers.iter())
+        {
+            for (storage, &slot) in channels.iter().zip(slots.iter()) {
+                assert_eq!(slot, storage.as_ptr() as usize);
+                assert!(storage[..8].iter().all(|&s| s == 0.0));
+                assert!(storage[8..].iter().all(|&s| s == 1.0));
+            }
+        }
+    }
+
+    // DELTON FORK DELTA: au-4c
+    #[test]
+    fn copy_output_to_copies_or_lends() {
+        let mut buffers = AuBuffers::new(&[], &[2, 2], 16);
+        buffers.output_channels[1][0].fill(0.25);
+        buffers.output_channels[1][1].fill(0.75);
+
+        // Host buffers: the samples are copied out
+        let mut host = vec![vec![0.0f32; 16]; 2];
+        let mut list = OwnedBufferList::new(2);
+        list.prepare(&mut host, 16);
+        assert!(unsafe { buffers.copy_output_to(1, list.as_mut_ptr(), 16) });
+        assert!(host[0].iter().all(|&s| s == 0.25));
+        assert!(host[1].iter().all(|&s| s == 0.75));
+
+        // Null buffers: they are pointed at our storage
+        let mut lent = OwnedBufferList::new(2);
+        let lent_ptr = lent.as_mut_ptr();
+        unsafe {
+            (*lent_ptr).mNumberBuffers = 2;
+            let first = (&raw mut (*lent_ptr).mBuffers) as *mut AudioBuffer;
+            for i in 0..2 {
+                first.add(i).write(AudioBuffer {
+                    mNumberChannels: 1,
+                    mDataByteSize: 0,
+                    mData: std::ptr::null_mut(),
+                });
+            }
+            assert!(buffers.copy_output_to(1, lent_ptr, 16));
+            for (i, channel) in buffers.output_channels[1].iter().enumerate() {
+                let buffer = &*first.add(i);
+                assert_eq!(buffer.mData as usize, channel.as_ptr() as usize);
+                assert_eq!(buffer.mDataByteSize, 64);
+            }
+        }
+
+        // No such element
+        assert!(!unsafe { buffers.copy_output_to(2, list.as_mut_ptr(), 16) });
+
+        // A host buffer of 8 frames cannot take 16
+        let mut short = vec![vec![0.0f32; 16]; 2];
+        let mut short_list = OwnedBufferList::new(2);
+        short_list.prepare(&mut short, 8);
+        assert!(!unsafe { buffers.copy_output_to(1, short_list.as_mut_ptr(), 16) });
     }
 }

@@ -16,7 +16,7 @@ pub enum RenderCheck {
 pub enum RenderError {
     /// The unit is not initialized.
     Uninitialized,
-    /// The output element is not 0.
+    /// The output element does not exist.
     InvalidElement,
     /// More frames than `MaximumFramesPerSlice`.
     TooManyFrames,
@@ -24,12 +24,15 @@ pub enum RenderError {
     FormatNotSupported,
 }
 
-/// In this order: not initialized -> Uninitialized; output_element != 0 -> InvalidElement;
-/// frames > max_frames -> TooManyFrames; frames == 0 -> Ok(NothingToDo);
+/// In this order: not initialized -> Uninitialized; output_element >= output_elements ->
+/// InvalidElement; frames > max_frames -> TooManyFrames; frames == 0 -> Ok(NothingToDo);
 /// buffer_count != expected_channels -> FormatNotSupported; else Ok(Proceed).
+/// `expected_channels` is the channel count of `output_element`.
+// DELTON FORK DELTA: au-4c (`output_elements` and the element check; was "output_element != 0")
 pub fn check_render(
     initialized: bool,
     output_element: u32,
+    output_elements: u32,
     frames: u32,
     max_frames: u32,
     buffer_count: u32,
@@ -38,7 +41,7 @@ pub fn check_render(
     if !initialized {
         return Err(RenderError::Uninitialized);
     }
-    if output_element != 0 {
+    if output_element >= output_elements {
         return Err(RenderError::InvalidElement);
     }
     if frames > max_frames {
@@ -61,7 +64,7 @@ mod tests {
     #[test]
     fn uninitialized_is_refused() {
         assert_eq!(
-            check_render(false, 0, 64, 512, 2, 2),
+            check_render(false, 0, 1, 64, 512, 2, 2),
             Err(RenderError::Uninitialized)
         );
     }
@@ -69,19 +72,37 @@ mod tests {
     #[test]
     fn wrong_element_is_refused() {
         assert_eq!(
-            check_render(true, 1, 64, 512, 2, 2),
+            check_render(true, 1, 1, 64, 512, 2, 2),
             Err(RenderError::InvalidElement)
+        );
+        // DELTON FORK DELTA: au-4c
+        assert_eq!(
+            check_render(true, 2, 2, 64, 512, 2, 2),
+            Err(RenderError::InvalidElement)
+        );
+    }
+
+    // DELTON FORK DELTA: au-4c
+    #[test]
+    fn an_aux_output_element_proceeds() {
+        assert_eq!(
+            check_render(true, 1, 2, 64, 512, 2, 2),
+            Ok(RenderCheck::Proceed)
+        );
+        assert_eq!(
+            check_render(true, 1, 2, 64, 512, 1, 2),
+            Err(RenderError::FormatNotSupported)
         );
     }
 
     #[test]
     fn too_many_frames_is_refused() {
         assert_eq!(
-            check_render(true, 0, 513, 512, 2, 2),
+            check_render(true, 0, 1, 513, 512, 2, 2),
             Err(RenderError::TooManyFrames)
         );
         assert_eq!(
-            check_render(true, 0, 512, 512, 2, 2),
+            check_render(true, 0, 1, 512, 512, 2, 2),
             Ok(RenderCheck::Proceed)
         );
     }
@@ -89,7 +110,7 @@ mod tests {
     #[test]
     fn zero_frames_does_nothing() {
         assert_eq!(
-            check_render(true, 0, 0, 512, 2, 2),
+            check_render(true, 0, 1, 0, 512, 2, 2),
             Ok(RenderCheck::NothingToDo)
         );
     }
@@ -97,7 +118,7 @@ mod tests {
     #[test]
     fn buffer_count_mismatch_is_refused() {
         assert_eq!(
-            check_render(true, 0, 64, 512, 1, 2),
+            check_render(true, 0, 1, 64, 512, 1, 2),
             Err(RenderError::FormatNotSupported)
         );
     }
@@ -105,7 +126,7 @@ mod tests {
     #[test]
     fn valid_call_proceeds() {
         assert_eq!(
-            check_render(true, 0, 64, 512, 2, 2),
+            check_render(true, 0, 1, 64, 512, 2, 2),
             Ok(RenderCheck::Proceed)
         );
     }
@@ -114,20 +135,20 @@ mod tests {
     fn checks_run_in_the_documented_order() {
         // Everything is wrong at once: the first check wins
         assert_eq!(
-            check_render(false, 3, 9999, 512, 1, 2),
+            check_render(false, 3, 1, 9999, 512, 1, 2),
             Err(RenderError::Uninitialized)
         );
         assert_eq!(
-            check_render(true, 3, 9999, 512, 1, 2),
+            check_render(true, 3, 1, 9999, 512, 1, 2),
             Err(RenderError::InvalidElement)
         );
         assert_eq!(
-            check_render(true, 0, 9999, 512, 1, 2),
+            check_render(true, 0, 1, 9999, 512, 1, 2),
             Err(RenderError::TooManyFrames)
         );
         // Zero frames wins over the buffer mismatch
         assert_eq!(
-            check_render(true, 0, 0, 512, 1, 2),
+            check_render(true, 0, 1, 0, 512, 1, 2),
             Ok(RenderCheck::NothingToDo)
         );
     }

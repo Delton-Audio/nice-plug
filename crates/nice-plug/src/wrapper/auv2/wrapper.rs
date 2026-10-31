@@ -475,8 +475,17 @@ pub(crate) struct Wrapper<P: AuPlugin> {
     formats: Mutex<Formats>,
     /// The current sample rate, as `f64` bits, for the property getters that must not lock.
     sample_rate_bits: AtomicU64,
-    /// The channel count of the main output, which a render's buffer list must match.
-    render_channels: AtomicU32,
+    // DELTON FORK DELTA: au-4c (was `render_channels`, the main output's count only)
+    /// The channel count of each output element in the current layout, element order (main first).
+    output_channels: Vec<AtomicU32>,
+    // DELTON FORK DELTA: au-4c
+    /// Whether our output storage holds a processed block (plugins with aux outputs only).
+    rendered_valid: AtomicBool,
+    // DELTON FORK DELTA: au-4c
+    /// The `mSampleTime` (as `f64::to_bits`) and frame count of that block.
+    rendered_sample_time: AtomicU64,
+    // DELTON FORK DELTA: au-4c
+    rendered_frames: AtomicU32,
     max_frames: AtomicU32,
     initialized: AtomicBool,
     current_layout: AtomicCell<Option<AudioIOLayout>>,
@@ -544,6 +553,17 @@ pub(crate) struct Wrapper<P: AuPlugin> {
     updated_state_receiver: channel::Receiver<PluginState>,
 }
 
+// DELTON FORK DELTA: au-4c
+/// Where `render_block` points the plugin's outputs.
+#[derive(Clone, Copy)]
+enum OutputTarget {
+    /// The host's list for the main output; aux outputs get our storage. Plugins without aux
+    /// outputs.
+    Host(*mut AudioBufferList),
+    /// Our own storage for every output element. Plugins with aux outputs (`render_bus`).
+    Internal,
+}
+
 impl<P: AuPlugin> Wrapper<P> {
     /// Build the wrapper for `Open`. Fails if the plugin has no audio layout AU can offer.
     pub(crate) fn new(unit: AudioComponentInstance) -> Result<Arc<Self>, OSStatus> {
@@ -555,12 +575,6 @@ impl<P: AuPlugin> Wrapper<P> {
         let first_layout = P::AUDIO_IO_LAYOUTS[first_idx];
         let shape = ElementShape::of(&first_layout);
         let (input_channels, output_channels) = element_channels(&first_layout);
-        if shape.aux_outputs > 0 {
-            crate::nice_warn!(
-                "AU: auxiliary outputs are not supported yet; the plugin's auxiliary outputs get \
-                 scratch buffers"
-            );
-        }
 
         let mut plugin = P::default();
         let task_executor = Mutex::new(plugin.task_executor());
@@ -685,10 +699,19 @@ impl<P: AuPlugin> Wrapper<P> {
             input_sources: (0..shape.input_elements())
                 .map(|_| AtomicCell::new(InputSource::None))
                 .collect(),
+            // DELTON FORK DELTA: au-4c (read before `shape` moves into the struct below)
+            output_channels: (0..shape.output_elements())
+                .map(|e| AtomicU32::new(output_channels.get(e as usize).copied().unwrap_or(0)))
+                .collect(),
+            // DELTON FORK DELTA: au-4c
+            rendered_valid: AtomicBool::new(false),
+            // DELTON FORK DELTA: au-4c
+            rendered_sample_time: AtomicU64::new(0),
+            // DELTON FORK DELTA: au-4c
+            rendered_frames: AtomicU32::new(0),
             shape,
             formats: Mutex::new(formats),
             sample_rate_bits: AtomicU64::new(DEFAULT_SAMPLE_RATE.to_bits()),
-            render_channels: AtomicU32::new(output_channels.first().copied().unwrap_or(0)),
             max_frames: AtomicU32::new(DEFAULT_MAX_FRAMES),
             initialized: AtomicBool::new(false),
             current_layout: AtomicCell::new(None),
@@ -960,16 +983,20 @@ impl<P: AuPlugin> Wrapper<P> {
                                 *buffers = new_buffers;
                                 *buffer_manager = new_manager;
                             }
-                            self.render_channels.store(
-                                output_channels.first().copied().unwrap_or(0),
-                                Ordering::Relaxed,
-                            );
+                            // DELTON FORK DELTA: au-4c
+                            for (slot, &count) in
+                                self.output_channels.iter().zip(output_channels.iter())
+                            {
+                                slot.store(count, Ordering::Relaxed);
+                            }
                             self.sample_rate_bits
                                 .store(sample_rate.to_bits(), Ordering::Relaxed);
 
                             // `activate()` is always followed by `reset()`
                             process_wrapper(|| plugin.reset());
                             self.last_process_status.store(ProcessStatus::Normal);
+                            // DELTON FORK DELTA: au-4c
+                            self.rendered_valid.store(false, Ordering::Release);
                             self.initialized.store(true, Ordering::Release);
                             result = NO_ERR;
                             break;
@@ -1009,6 +1036,8 @@ impl<P: AuPlugin> Wrapper<P> {
         if !self.initialized.swap(false, Ordering::AcqRel) {
             return NO_ERR;
         }
+        // DELTON FORK DELTA: au-4c
+        self.rendered_valid.store(false, Ordering::Release);
 
         // In the case a host misbehaves and tries to uninitialize the unit without waiting for a
         // render to finish, manually wait for that render to finish.
@@ -1034,6 +1063,8 @@ impl<P: AuPlugin> Wrapper<P> {
     pub(crate) fn reset(&self) -> OSStatus {
         // DELTON FORK DELTA: au-4b
         while self.midi_in.pop().is_some() {}
+        // DELTON FORK DELTA: au-4c
+        self.rendered_valid.store(false, Ordering::Release);
 
         if !self.initialized.load(Ordering::Acquire) {
             return NO_ERR;
@@ -2126,13 +2157,20 @@ impl<P: AuPlugin> Wrapper<P> {
 
         // SAFETY: Checked for null above.
         let buffer_count = unsafe { (*io_data).mNumberBuffers };
+        // DELTON FORK DELTA: au-4c
+        let output_elements = self.shape.output_elements();
+        let expected_channels = self
+            .output_channels
+            .get(output_bus as usize)
+            .map_or(0, |count| count.load(Ordering::Relaxed));
         match check_render(
             self.initialized.load(Ordering::Acquire),
             output_bus,
+            output_elements,
             frames,
             self.max_frames.load(Ordering::Relaxed),
             buffer_count,
-            self.render_channels.load(Ordering::Relaxed),
+            expected_channels,
         ) {
             Ok(RenderCheck::Proceed) => (),
             Ok(RenderCheck::NothingToDo) => return NO_ERR,
@@ -2164,8 +2202,14 @@ impl<P: AuPlugin> Wrapper<P> {
                 .call(&mut flags, timestamp, output_bus, frames, io_data)
         };
 
-        // SAFETY: The pointers were checked for null above.
-        let status = unsafe { self.render_block(timestamp, frames, io_data) };
+        // DELTON FORK DELTA: au-4c: with aux outputs, one process per sample time serves every bus
+        let status = if output_elements > 1 {
+            // SAFETY: The pointers were checked for null above.
+            unsafe { self.render_bus(timestamp, output_bus, frames, io_data) }
+        } else {
+            // SAFETY: The pointers were checked for null above.
+            unsafe { self.render_block(timestamp, frames, OutputTarget::Host(io_data)) }
+        };
 
         let mut flags = AudioUnitRenderActionFlags(
             base_flags.0
@@ -2185,17 +2229,62 @@ impl<P: AuPlugin> Wrapper<P> {
         status
     }
 
+    // DELTON FORK DELTA: au-4c
+    /// One output bus of a plugin with aux outputs. The first call at a new sample time (or with a
+    /// different frame count) processes the plugin once into our storage for every bus; every call
+    /// then copies its own bus out. Sample times are compared as bits: the host passes the same
+    /// value for each bus of one block.
+    ///
+    /// # Safety
+    ///
+    /// `timestamp` and `io_data` must be valid.
+    unsafe fn render_bus(
+        &self,
+        timestamp: *const AudioTimeStamp,
+        output_bus: u32,
+        frames: u32,
+        io_data: *mut AudioBufferList,
+    ) -> OSStatus {
+        // SAFETY: The caller guarantees `timestamp` is valid.
+        let sample_time = unsafe { (*timestamp).mSampleTime }.to_bits();
+        let fresh = self.rendered_valid.load(Ordering::Acquire)
+            && self.rendered_sample_time.load(Ordering::Acquire) == sample_time
+            && self.rendered_frames.load(Ordering::Acquire) == frames;
+        if !fresh {
+            self.rendered_valid.store(false, Ordering::Release);
+            // SAFETY: Forwarded from the caller.
+            let status = unsafe { self.render_block(timestamp, frames, OutputTarget::Internal) };
+            if status != NO_ERR {
+                return status;
+            }
+            self.rendered_sample_time
+                .store(sample_time, Ordering::Release);
+            self.rendered_frames.store(frames, Ordering::Release);
+            self.rendered_valid.store(true, Ordering::Release);
+        }
+
+        let Ok(mut buffers) = self.buffers.try_borrow_mut() else {
+            return kAudioUnitErr_CannotDoInCurrentContext;
+        };
+        // SAFETY: The caller guarantees `io_data` is valid.
+        if unsafe { buffers.copy_output_to(output_bus as usize, io_data, frames) } {
+            NO_ERR
+        } else {
+            PARAM_ERR
+        }
+    }
+
     /// Pull the inputs, process one block, fill the output. Steps 3 to 10 of the render.
     ///
     /// # Safety
     ///
-    /// `timestamp` and `io_data` must be valid, and `io_data` must hold one buffer per main output
-    /// channel.
+    /// `timestamp` must be valid. With `OutputTarget::Host`, the list must hold one buffer per main
+    /// output channel; `OutputTarget::Internal` needs nothing.
     unsafe fn render_block(
         &self,
         timestamp: *const AudioTimeStamp,
         frames: u32,
-        io_data: *mut AudioBufferList,
+        target: OutputTarget,
     ) -> OSStatus {
         let Ok(mut buffers) = self.buffers.try_borrow_mut() else {
             return kAudioUnitErr_CannotDoInCurrentContext;
@@ -2267,9 +2356,15 @@ impl<P: AuPlugin> Wrapper<P> {
         }
 
         // The output: the host's buffers, or ours when it passed none
-        // SAFETY: The caller guarantees `io_data` holds one buffer per main output channel.
-        if !unsafe { buffers.prepare_outputs(io_data, frames) } {
-            return PARAM_ERR;
+        match target {
+            OutputTarget::Host(io_data) => {
+                // SAFETY: The caller guarantees `io_data` holds one buffer per main output channel.
+                if !unsafe { buffers.prepare_outputs(io_data, frames) } {
+                    return PARAM_ERR;
+                }
+            }
+            // DELTON FORK DELTA: au-4c
+            OutputTarget::Internal => buffers.prepare_outputs_internal(frames),
         }
 
         // Host parameter changes since the last render
