@@ -15,6 +15,7 @@ use crate::{
     audio_setup::{AudioIOLayout, AuxiliaryBuffers, BufferConfig},
     buffer::Buffer,
     context::{activate::ActivateContext, process::ProcessContext},
+    host_notices::HostNotices,
     midi::{MidiConfig, sysex::SysExMessage},
     params::Params,
 };
@@ -217,6 +218,16 @@ pub trait Plugin: Default + Send + 'static {
         // In the default implementation we can simply ignore the value
         Box::new(|_| ())
     }
+
+    /// Hands the plugin a [`HostNotices`] handle, through which it can tell its host things that
+    /// need no editor, such as [`HostNotices::param_values_changed()`]. Called once, right after
+    /// the wrapper is created, before [`editor()`][Self::editor()] and before any call that comes
+    /// from the host. [`task_executor()`][Self::task_executor()] and [`params()`][Self::params()]
+    /// are queried earlier, because the wrapper needs them to be built.
+    ///
+    /// The handle is cheap to clone and may be used from any thread. Defaults to dropping it.
+    // DELTON FORK DELTA: hpre-1
+    fn attach_host_notices(&mut self, notices: HostNotices) {}
 
     /// The plugin's parameters. The host will update the parameter values before calling
     /// `process()`. These string parameter IDs parameters should never change as they are used to

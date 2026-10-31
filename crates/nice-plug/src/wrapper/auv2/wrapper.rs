@@ -25,6 +25,8 @@ use nice_plug_core::editor::dpi::{NativeSize, Size};
 #[cfg(feature = "editor")]
 use nice_plug_core::editor::{Editor, EditorHandle, SpawnedEditor};
 // DELTON FORK DELTA: au-4b
+// DELTON FORK DELTA: hpre-1
+use nice_plug_core::host_notices::{HostNoticeSink, HostNotices};
 use nice_plug_core::midi::{MidiConfig, NoteEvent, PluginNoteEvent};
 use nice_plug_core::params::internals::ParamPtr;
 use nice_plug_core::params::{ParamFlags, Params};
@@ -67,6 +69,8 @@ use super::AuPlugin;
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::util::permit_alloc;
 use crate::wrapper::util::buffer_management::BufferManager;
+// DELTON FORK DELTA: hpre-1
+use crate::wrapper::util::notice_flag::NoticeFlag;
 use crate::wrapper::util::process_wrapper;
 use crate::wrapper::util::raw_automation::RawAutomation;
 
@@ -99,6 +103,10 @@ pub enum Task<P: AuPlugin> {
     StateChanged,
     /// The plugin's latency changed: tells the `Latency` property listeners.
     LatencyChanged,
+    /// The plugin wrote parameter values with no editor open: tells the host's parameter
+    /// listeners about every parameter. Posted by the plugin's [`HostNotices`].
+    // DELTON FORK DELTA: hpre-1
+    ParamValuesNotice,
     /// The editor asked for a new size: resize its container (main thread).
     // DELTON FORK DELTA: au-2
     #[cfg(feature = "editor")]
@@ -467,6 +475,10 @@ pub(crate) struct Wrapper<P: AuPlugin> {
     /// A realtime-safe task queue so the wrapper can schedule tasks that need to run on the main
     /// thread. Posted to through [`Self::schedule_gui()`]. Initialized late: it needs the `Arc`.
     event_loop: AtomicRefCell<Option<OsEventLoop<Task<P>, Self>>>,
+    /// Raised by the plugin's [`HostNotices`] when parameter values changed with no editor open;
+    /// taken by the `ParamValuesNotice` task, so a burst of notices posts one task.
+    // DELTON FORK DELTA: hpre-1
+    param_values_notice: NoticeFlag,
 
     // Configuration: only changed while uninitialized, read by render.
     /// The element structure shared by every layout this unit offers.
@@ -695,6 +707,8 @@ impl<P: AuPlugin> Wrapper<P> {
             #[cfg(feature = "editor")]
             editor_slot: AtomicRefCell::new(None),
             event_loop: AtomicRefCell::new(None),
+            // DELTON FORK DELTA: hpre-1
+            param_values_notice: NoticeFlag::default(),
 
             input_sources: (0..shape.input_elements())
                 .map(|_| AtomicCell::new(InputSource::None))
@@ -764,6 +778,17 @@ impl<P: AuPlugin> Wrapper<P> {
         // The event loop needs the `Arc` to hold a weak reference to the wrapper
         *wrapper.event_loop.borrow_mut() =
             Some(OsEventLoop::new_and_spawn(Arc::downgrade(&wrapper)));
+
+        // Hand the plugin its channel to the host before anything else can run. The plugin lock is
+        // free: nothing but this function has the wrapper yet.
+        // DELTON FORK DELTA: hpre-1
+        wrapper
+            .plugin
+            .try_lock()
+            .unwrap()
+            .attach_host_notices(HostNotices::new(Arc::new(AuHostNotices {
+                wrapper: Arc::downgrade(&wrapper),
+            })));
 
         // The editor also needs to be initialized late so the async executor can work
         // DELTON FORK DELTA: au-2
@@ -2912,6 +2937,35 @@ impl<P: AuPlugin> Wrapper<P> {
     }
 }
 
+/// The AU end of the plugin's [`HostNotices`]: raises the wrapper's flag, and the call that raised
+/// it posts one `ParamValuesNotice` task.
+// DELTON FORK DELTA: hpre-1
+struct AuHostNotices<P: AuPlugin> {
+    wrapper: Weak<Wrapper<P>>,
+}
+
+impl<P: AuPlugin> HostNoticeSink for AuHostNotices<P> {
+    fn param_values_changed(&self) {
+        let Some(wrapper) = self.wrapper.upgrade() else {
+            return;
+        };
+
+        if wrapper.param_values_notice.raise() {
+            // `post_gui`, not `schedule_gui`: on the main thread `schedule_gui` would run the task
+            // inline, once per notice
+            let posted = match wrapper.event_loop.borrow().as_ref() {
+                Some(event_loop) => event_loop.post_gui(Task::ParamValuesNotice),
+                None => false,
+            };
+            if !posted {
+                // The task queue is full and nothing is coming to clear the flag: clear it so the
+                // next notice tries again
+                wrapper.param_values_notice.take();
+            }
+        }
+    }
+}
+
 impl<P: AuPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
     fn execute(&self, task: Task<P>, _is_gui_thread: bool) {
         // This function is always called from the main thread
@@ -2953,6 +3007,18 @@ impl<P: AuPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
             }
             Task::LatencyChanged => {
                 self.notify_property(kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0)
+            }
+            // DELTON FORK DELTA: hpre-1
+            Task::ParamValuesNotice => {
+                // Take the flag *before* the host re-reads the values, so a write that lands after
+                // this raises it again and posts a new task
+                self.param_values_notice.take();
+                for entry in &self.table.entries {
+                    self.notify_parameter_event(
+                        AudioUnitEventType::ParameterValueChange,
+                        entry.id,
+                    );
+                }
             }
             // DELTON FORK DELTA: au-2
             #[cfg(feature = "editor")]

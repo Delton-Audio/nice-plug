@@ -5,6 +5,8 @@ pub mod audio_setup;
 pub mod buffer;
 pub mod context;
 pub mod formatters;
+// DELTON FORK DELTA: hpre-1
+pub mod host_notices;
 pub mod midi;
 pub mod params;
 pub mod plugin;

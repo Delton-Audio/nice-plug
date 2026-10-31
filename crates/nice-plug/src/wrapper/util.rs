@@ -10,6 +10,8 @@ use crate::util::permit_alloc;
 pub(crate) mod buffer_management;
 #[cfg(all(debug_assertions, feature = "editor"))]
 pub(crate) mod context_checks;
+// DELTON FORK DELTA: hpre-1
+pub(crate) mod notice_flag;
 // DELTON FORK DELTA
 pub(crate) mod raw_automation;
 

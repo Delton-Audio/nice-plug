@@ -166,22 +166,29 @@ where
 
             true
         } else {
-            let success = self.tasks_sender.try_send(task).is_ok();
-            if success {
-                // Instead of polling on a timer, we can just wake up the window whenever there's a
-                // new message.
-                unsafe {
-                    let _ = PostMessageA(
-                        Some(self.message_window.0),
-                        NOTIFY_MESSAGE_ID,
-                        WPARAM(0),
-                        LPARAM(0),
-                    );
-                }
-            }
-
-            success
+            self.post_gui(task)
         }
+    }
+
+    // DELTON FORK DELTA: hpre-1
+    fn post_gui(&self, task: T) -> bool {
+        // Legal on the main thread too: the task waits in the queue and the message below makes
+        // the host's message loop run it on a later turn (`PostMessageA` never dispatches inline)
+        let success = self.tasks_sender.try_send(task).is_ok();
+        if success {
+            // Instead of polling on a timer, we can just wake up the window whenever there's a
+            // new message.
+            unsafe {
+                let _ = PostMessageA(
+                    Some(self.message_window.0),
+                    NOTIFY_MESSAGE_ID,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+
+        success
     }
 
     fn schedule_background(&self, task: T) -> bool {

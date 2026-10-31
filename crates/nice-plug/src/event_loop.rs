@@ -57,6 +57,17 @@ where
     #[must_use]
     fn schedule_gui(&self, task: T) -> bool;
 
+    /// Post the task to the task queue so it runs on the main thread (or the event loop's worker),
+    /// *always*: unlike [`schedule_gui()`][Self::schedule_gui()] this never runs the task inline,
+    /// not even when called from the main thread. Several tasks posted in one main-thread turn
+    /// therefore reach the queue, and a plugin can coalesce them with a flag. This function needs
+    /// to be callable at any time without blocking, from any thread.
+    ///
+    /// If the task queue is full, then this will return false.
+    // DELTON FORK DELTA: hpre-1
+    #[must_use]
+    fn post_gui(&self, task: T) -> bool;
+
     /// Post a task to the background task queue so it can be run in a dedicated background thread
     /// without blocking the plugin's GUI. This function needs to be callable at any time without
     /// blocking.

@@ -33,6 +33,8 @@ pub use crate::context::remote_controls::{
 };
 #[cfg(feature = "editor")]
 pub use crate::editor::{Editor, Modifiers, ParentWindowHandle, ResizeHint, VirtualKeyCode};
+// DELTON FORK DELTA: hpre-1
+pub use crate::host_notices::{HostNoticeSink, HostNotices};
 pub use crate::midi::sysex::SysExMessage;
 pub use crate::midi::{MidiConfig, NoteEvent, PluginNoteEvent, control_change};
 pub use crate::params::Params;

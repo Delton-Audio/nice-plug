@@ -73,6 +73,8 @@ use nice_plug_core::context::gui::GuiContext;
 use nice_plug_core::context::process::{ParamAutomationPoint, Transport};
 #[cfg(feature = "editor")]
 use nice_plug_core::editor::{Editor, SpawnedEditor};
+// DELTON FORK DELTA: hpre-1
+use nice_plug_core::host_notices::{HostNoticeSink, HostNotices};
 use nice_plug_core::midi::{Channel, Key, MidiConfig, NoteEvent, PluginNoteEvent, VoiceID};
 use nice_plug_core::params::internals::ParamPtr;
 use nice_plug_core::params::{ParamFlags, Params};
@@ -108,6 +110,8 @@ use crate::wrapper::state::{self};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 // DELTON FORK DELTA
 use crate::wrapper::util::raw_automation::{RawAutomation, clap_value_to_normalized};
+// DELTON FORK DELTA: hpre-1
+use crate::wrapper::util::notice_flag::NoticeFlag;
 use crate::wrapper::util::{clamp_input_event_timing, hash_param_id, process_wrapper, strlcpy};
 
 /// How many output parameter changes we can store in our output parameter change queue. Storing
@@ -288,6 +292,10 @@ pub struct Wrapper<P: ClapPlugin> {
     /// [`on_main_thread()`][Self::on_main_thread()] on the main thread, and then continue to pop
     /// tasks off this queue there until it is empty.
     tasks: ArrayQueue<Task<P>>,
+    /// Raised by the plugin's [`HostNotices`] when parameter values changed with no editor open;
+    /// taken by the `RescanParamValues` task, so a burst of notices posts one task.
+    // DELTON FORK DELTA: hpre-1
+    param_values_notice: NoticeFlag,
     /// The ID of the main thread. In practice this is the ID of the thread that created this
     /// object. If the host supports the thread check extension (and
     /// [`host_thread_check`][Self::host_thread_check] thus contains a value), then that extension
@@ -320,6 +328,29 @@ pub enum Task<P: Plugin> {
     VoiceInfoChanged,
     /// Tell the host that it should rescan the current parameter values.
     RescanParamValues,
+}
+
+/// The CLAP end of the plugin's [`HostNotices`]: raises the wrapper's flag, and the call that
+/// raised it posts one `RescanParamValues` task.
+// DELTON FORK DELTA: hpre-1
+struct ClapHostNotices<P: ClapPlugin> {
+    wrapper: Weak<Wrapper<P>>,
+}
+
+impl<P: ClapPlugin> HostNoticeSink for ClapHostNotices<P> {
+    fn param_values_changed(&self) {
+        let Some(wrapper) = self.wrapper.upgrade() else {
+            return;
+        };
+
+        // `post_gui`, not `schedule_gui`: on the main thread `schedule_gui` would rescan inline,
+        // once per notice
+        if wrapper.param_values_notice.raise() && !wrapper.post_gui(Task::RescanParamValues) {
+            // The task queue is full and nothing is coming to clear the flag: clear it so the
+            // next notice tries again
+            wrapper.param_values_notice.take();
+        }
+    }
 }
 
 /// The types of CLAP parameter updates for events.
@@ -365,15 +396,22 @@ impl<P: ClapPlugin> EventLoop<Task<P>, Wrapper<P>> for Wrapper<P> {
             self.execute(task, true);
             true
         } else {
-            let success = self.tasks.push(task).is_ok();
-            if success {
-                // CLAP lets us use the host's event loop instead of having to implement our own
-                let host = &self.host_callback;
-                unsafe_clap_call! { host=>request_callback(&**host) };
-            }
-
-            success
+            self.post_gui(task)
         }
+    }
+
+    // DELTON FORK DELTA: hpre-1
+    fn post_gui(&self, task: Task<P>) -> bool {
+        // Legal on the main thread too: `request_callback` is callable from any thread, and the
+        // host runs `on_main_thread` on a later turn of its loop, never inside this call
+        let success = self.tasks.push(task).is_ok();
+        if success {
+            // CLAP lets us use the host's event loop instead of having to implement our own
+            let host = &self.host_callback;
+            unsafe_clap_call! { host=>request_callback(&**host) };
+        }
+
+        success
     }
 
     fn schedule_background(&self, task: Task<P>) -> bool {
@@ -477,16 +515,23 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                     crate::nice_warn!("Host does not support the voice-info extension");
                 }
             },
-            Task::RescanParamValues => match &*self.host_params.borrow() {
-                Some(host_params) => {
-                    crate::nice_debug_assert!(is_gui_thread);
-                    unsafe_clap_call! { host_params=>rescan(&*self.host_callback, CLAP_PARAM_RESCAN_VALUES) };
+            Task::RescanParamValues => {
+                // Take the notice flag *before* the host re-reads the values, so a write that
+                // lands after this raises it again and posts a new rescan. Also when there is no
+                // params extension, or the flag would stay raised and block every later notice.
+                // DELTON FORK DELTA: hpre-1
+                self.param_values_notice.take();
+                match &*self.host_params.borrow() {
+                    Some(host_params) => {
+                        crate::nice_debug_assert!(is_gui_thread);
+                        unsafe_clap_call! { host_params=>rescan(&*self.host_callback, CLAP_PARAM_RESCAN_VALUES) };
+                    }
+                    None => {
+                        #[cfg(debug_assertions)]
+                        crate::nice_warn!("Host does not support the parameter extension");
+                    }
                 }
-                None => {
-                    #[cfg(debug_assertions)]
-                    crate::nice_warn!("Host does not support the parameter extension");
-                }
-            },
+            }
         };
     }
 }
@@ -771,6 +816,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             ),
 
             tasks: ArrayQueue::new(TASK_QUEUE_CAPACITY),
+            param_values_notice: NoticeFlag::default(),
             main_thread_id: thread::current().id(),
             // Initialized later as it needs a reference to the wrapper for the executor
             background_thread: AtomicRefCell::new(None),
@@ -780,6 +826,17 @@ impl<P: ClapPlugin> Wrapper<P> {
         // when opening plugin editors
         let wrapper = Arc::new(wrapper);
         *wrapper.this.borrow_mut() = Arc::downgrade(&wrapper);
+
+        // Hand the plugin its channel to the host before anything else can run. The plugin lock is
+        // free: nothing but this function has the wrapper yet.
+        // DELTON FORK DELTA: hpre-1
+        wrapper
+            .plugin
+            .try_lock()
+            .unwrap()
+            .attach_host_notices(HostNotices::new(Arc::new(ClapHostNotices {
+                wrapper: Arc::downgrade(&wrapper),
+            })));
 
         // The `clap_plugin::plugin_data` field needs to point to this wrapper so we can access it
         // from the vtable functions

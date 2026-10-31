@@ -9,6 +9,8 @@ use nice_plug_core::context::process::Transport;
 use nice_plug_core::editor::dpi::Size;
 #[cfg(feature = "editor")]
 use nice_plug_core::editor::{Editor, SpawnedEditor};
+// DELTON FORK DELTA: hpre-1
+use nice_plug_core::host_notices::{HostNoticeSink, HostNotices};
 use nice_plug_core::midi::{MidiConfig, PluginNoteEvent};
 use nice_plug_core::params::internals::ParamPtr;
 use nice_plug_core::params::{ParamFlags, Params};
@@ -37,6 +39,8 @@ use crate::util::permit_alloc;
 use crate::wrapper::state;
 use crate::wrapper::util::buffer_management::BufferManager;
 use crate::wrapper::util::hash_param_id;
+// DELTON FORK DELTA: hpre-1
+use crate::wrapper::util::notice_flag::NoticeFlag;
 // DELTON FORK DELTA
 use crate::wrapper::util::raw_automation::RawAutomation;
 use crate::wrapper::vst3::Vst3Plugin;
@@ -91,6 +95,11 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     ///
     /// TODO: Is there a better type for Send+Sync late initialization?
     pub event_loop: AtomicRefCell<Option<OsEventLoop<Task<P>, Self>>>,
+
+    /// Raised by the plugin's [`HostNotices`] when parameter values changed with no editor open;
+    /// taken by the `ParamValuesNotice` task, so a burst of notices posts one task.
+    // DELTON FORK DELTA: hpre-1
+    pub param_values_notice: NoticeFlag,
 
     /// Whether the plugin is currently processing audio. In other words, the last state
     /// `IAudioProcessor::setActive()` has been called with.
@@ -199,6 +208,10 @@ pub enum Task<P: Plugin> {
     /// Trigger a restart with the given restart flags. This is a bit set of the flags from
     /// [`vst3::Steinberg::Vst::RestartFlags`].
     TriggerRestart(i32),
+    /// The plugin wrote parameter values with no editor open: tell the host to re-read them
+    /// (`restartComponent(kParamValuesChanged)`). Posted by the plugin's [`HostNotices`].
+    // DELTON FORK DELTA: hpre-1
+    ParamValuesNotice,
     // Request the editor to be resized according to its current size. Right now there is no way to
     // handle "denied resize" requests yet.
     #[cfg(feature = "editor")]
@@ -239,6 +252,35 @@ impl<P: Plugin> ProcessEvent<P> {
         match self {
             ProcessEvent::ParameterChange { timing, .. } => *timing,
             ProcessEvent::NoteEvent(event) => event.timing(),
+        }
+    }
+}
+
+/// The VST3 end of the plugin's [`HostNotices`]: raises the wrapper's flag, and the call that
+/// raised it posts one `ParamValuesNotice` task.
+// DELTON FORK DELTA: hpre-1
+struct Vst3HostNotices<P: Vst3Plugin> {
+    wrapper: std::sync::Weak<WrapperInner<P>>,
+}
+
+impl<P: Vst3Plugin> HostNoticeSink for Vst3HostNotices<P> {
+    fn param_values_changed(&self) {
+        let Some(wrapper) = self.wrapper.upgrade() else {
+            return;
+        };
+
+        if wrapper.param_values_notice.raise() {
+            // `post_gui`, not `schedule_gui`: on the main thread `schedule_gui` would run the task
+            // inline, once per notice
+            let posted = match wrapper.event_loop.borrow().as_ref() {
+                Some(event_loop) => event_loop.post_gui(Task::ParamValuesNotice),
+                None => false,
+            };
+            if !posted {
+                // The task queue is full and nothing is coming to clear the flag: clear it so the
+                // next notice tries again
+                wrapper.param_values_notice.take();
+            }
         }
     }
 }
@@ -357,6 +399,8 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             is_editor_open: AtomicBool::new(false),
 
             event_loop: AtomicRefCell::new(None),
+            // DELTON FORK DELTA: hpre-1
+            param_values_notice: NoticeFlag::default(),
 
             is_processing: AtomicBool::new(false),
             // DELTON FORK DELTA
@@ -413,6 +457,17 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         //        is separate from the internal COM-style reference count.
         *wrapper.event_loop.borrow_mut() =
             Some(OsEventLoop::new_and_spawn(Arc::downgrade(&wrapper)));
+
+        // Hand the plugin its channel to the host before anything else can run. The plugin lock is
+        // free: nothing but this function has the wrapper yet.
+        // DELTON FORK DELTA: hpre-1
+        wrapper
+            .plugin
+            .try_lock()
+            .unwrap()
+            .attach_host_notices(HostNotices::new(Arc::new(Vst3HostNotices {
+                wrapper: Arc::downgrade(&wrapper),
+            })));
 
         // The editor also needs to be initialized later so the Async executor can work.
 
@@ -748,6 +803,25 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
                         .get()
                         .handle
                         .param_value_changed(param_id, normalized_value);
+                }
+            }
+            // DELTON FORK DELTA: hpre-1
+            Task::ParamValuesNotice => {
+                // Take the flag *before* the host re-reads the values, so a write that lands after
+                // this raises it again and posts a new task
+                self.param_values_notice.take();
+                // Without a handler the host has not connected yet and reads every value when it
+                // does, so there is nothing to tell it
+                if let Some(handler) = &*self.component_handler.borrow() {
+                    unsafe {
+                        crate::nice_debug_assert!(is_gui_thread);
+                        let result = handler.restartComponent(RestartFlags_::kParamValuesChanged);
+                        crate::nice_debug_assert_eq!(
+                            result,
+                            kResultOk,
+                            "Failed the parameter values changed restart request"
+                        );
+                    }
                 }
             }
             Task::TriggerRestart(flags) => match &*self.component_handler.borrow() {

@@ -98,17 +98,24 @@ where
 
             true
         } else {
-            // Only signal the main thread callback to be called if the task was added to the queue.
-            let success = self.main_thread_sender.try_send(task).is_ok();
-            if success {
-                unsafe {
-                    CFRunLoopSourceSignal(self.loop_source.0);
-                    CFRunLoopWakeUp(CFRunLoopGetMain());
-                }
-            }
-
-            success
+            self.post_gui(task)
         }
+    }
+
+    // DELTON FORK DELTA: hpre-1
+    fn post_gui(&self, task: T) -> bool {
+        // Legal on the main thread too: the signalled run-loop source performs on a later turn of
+        // the main run loop, never inside this call
+        // Only signal the main thread callback to be called if the task was added to the queue.
+        let success = self.main_thread_sender.try_send(task).is_ok();
+        if success {
+            unsafe {
+                CFRunLoopSourceSignal(self.loop_source.0);
+                CFRunLoopWakeUp(CFRunLoopGetMain());
+            }
+        }
+
+        success
     }
 
     fn schedule_background(&self, task: T) -> bool {

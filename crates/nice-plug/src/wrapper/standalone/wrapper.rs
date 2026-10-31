@@ -7,6 +7,8 @@ use nice_plug_core::context::gui::GuiContext;
 use nice_plug_core::context::process::Transport;
 #[cfg(feature = "editor")]
 use nice_plug_core::editor::{Editor, EditorHandle, SpawnedEditor};
+// DELTON FORK DELTA: hpre-1
+use nice_plug_core::host_notices::{HostNoticeSink, HostNotices};
 use nice_plug_core::midi::PluginNoteEvent;
 use nice_plug_core::params::internals::ParamPtr;
 use nice_plug_core::params::{ParamFlags, Params};
@@ -117,6 +119,14 @@ pub enum Task<P: Plugin> {
     ParameterValueChanged(ParamPtr, f32),
 }
 
+/// The standalone end of the plugin's [`HostNotices`]: there is no host, so nothing happens.
+// DELTON FORK DELTA: hpre-1
+struct NoHostNotices;
+
+impl HostNoticeSink for NoHostNotices {
+    fn param_values_changed(&self) {}
+}
+
 /// Errors that may arise while initializing the wrapped plugins.
 #[derive(Debug, thiserror::Error)]
 pub enum WrapperError {
@@ -159,6 +169,9 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         let audio_io_layout = config.audio_io_layout_or_exit::<P>();
 
         let mut plugin = P::default();
+        // There is no host to tell in the standalone target, so the plugin's notices go nowhere
+        // DELTON FORK DELTA: hpre-1
+        plugin.attach_host_notices(HostNotices::new(Arc::new(NoHostNotices)));
         let task_executor = Mutex::new(plugin.task_executor());
         let params = plugin.params();
 

@@ -49,8 +49,15 @@ where
 
             true
         } else {
-            self.background_thread.schedule(task)
+            self.post_gui(task)
         }
+    }
+
+    // DELTON FORK DELTA: hpre-1
+    fn post_gui(&self, task: T) -> bool {
+        // There is no main thread on Linux: the worker thread runs GUI tasks, and handing it a
+        // task from any thread, the creating one included, is always legal
+        self.background_thread.schedule(task)
     }
 
     fn schedule_background(&self, task: T) -> bool {
