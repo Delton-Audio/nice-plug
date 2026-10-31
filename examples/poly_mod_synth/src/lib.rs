@@ -635,5 +635,13 @@ impl Vst3Plugin for PolyModSynth {
     ];
 }
 
+// DELTON FORK DELTA: au-4b, the AU identity CI validates with auval
+impl AuPlugin for PolyModSynth {
+    const AU_MANUFACTURER: [u8; 4] = *b"Nplg";
+    const AU_SUBTYPE: [u8; 4] = *b"PMSy";
+}
+
 nice_export_clap!(PolyModSynth);
 nice_export_vst3!(PolyModSynth);
+// DELTON FORK DELTA: au-4b
+nice_export_auv2!(PolyModSynth);

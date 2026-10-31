@@ -232,5 +232,13 @@ impl Vst3Plugin for Sine {
     ];
 }
 
+// DELTON FORK DELTA: au-4b, the AU identity CI validates with auval
+impl AuPlugin for Sine {
+    const AU_MANUFACTURER: [u8; 4] = *b"Nplg";
+    const AU_SUBTYPE: [u8; 4] = *b"NSin";
+}
+
 nice_export_clap!(Sine);
 nice_export_vst3!(Sine);
+// DELTON FORK DELTA: au-4b
+nice_export_auv2!(Sine);

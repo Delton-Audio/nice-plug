@@ -1,7 +1,7 @@
 // DELTON FORK DELTA: au-1, AUv2 wrapper
 //! The contexts handed to the plugin: activate, process and (with the `editor` feature) the GUI
 //! context the editor gets in `spawn`.
-use atomic_refcell::AtomicRef;
+use atomic_refcell::{AtomicRef, AtomicRefMut};
 use nice_plug_core::audio_setup::ProcessMode;
 use nice_plug_core::context::activate::ActivateContext;
 // DELTON FORK DELTA: au-2
@@ -12,12 +12,15 @@ use nice_plug_core::context::process::{
 };
 use nice_plug_core::context::PluginApi;
 use nice_plug_core::midi::PluginNoteEvent;
+// DELTON FORK DELTA: au-4b
+use nice_plug_core::midi::MidiResult;
 // DELTON FORK DELTA: au-2
 #[cfg(feature = "editor")]
 use nice_plug_core::params::internals::ParamPtr;
 // DELTON FORK DELTA: au-2
 #[cfg(feature = "editor")]
 use nice_plug_core::plugin::PluginState;
+use std::borrow::Borrow;
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
 // DELTON FORK DELTA: au-2
@@ -27,6 +30,8 @@ use std::sync::Weak;
 // DELTON FORK DELTA: au-2
 #[cfg(feature = "editor")]
 use super::sys::AudioUnitEventType;
+// DELTON FORK DELTA: au-4b
+use super::midi;
 use super::wrapper::{Task, Wrapper};
 use super::AuPlugin;
 use crate::wrapper::util::raw_automation::RawAutomation;
@@ -47,6 +52,17 @@ pub(crate) struct WrapperProcessContext<'a, P: AuPlugin> {
     pub(super) inner: &'a Wrapper<P>,
     pub(super) raw_automation_guard: AtomicRef<'a, RawAutomation>,
     pub(super) transport: Transport,
+    // DELTON FORK DELTA: au-4b
+    /// This block's input events, sorted. `next_input` is the next one `next_event` returns.
+    pub(super) input_events: AtomicRef<'a, Vec<PluginNoteEvent<P>>>,
+    // DELTON FORK DELTA: au-4b
+    pub(super) next_input: usize,
+    // DELTON FORK DELTA: au-4b
+    /// What `try_send_event` queued this block: (timing, message start in `output_bytes`, length).
+    pub(super) output_events: AtomicRefMut<'a, Vec<(u32, u32, u32)>>,
+    // DELTON FORK DELTA: au-4b
+    /// The bytes of this block's outgoing messages.
+    pub(super) output_bytes: AtomicRefMut<'a, Vec<u8>>,
 }
 
 impl<P: AuPlugin> ActivateContext<P> for WrapperActivateContext<'_, P> {
@@ -101,17 +117,60 @@ impl<P: AuPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
         self.inner.current_process_mode.load()
     }
 
+    // DELTON FORK DELTA: au-4b
     fn next_event(&mut self) -> Option<PluginNoteEvent<P>> {
-        // MIDI input arrives with au-4
-        None
+        let event = self.input_events.get(self.next_input).cloned();
+        if event.is_some() {
+            self.next_input += 1;
+        }
+
+        event
     }
 
     fn try_send_event(
         &mut self,
         event: PluginNoteEvent<P>,
     ) -> Result<(), (PluginNoteEvent<P>, SendEventError)> {
-        // MIDI output arrives with au-4
-        Err((event, SendEventError::NoOutputBuffer))
+        // DELTON FORK DELTA: au-4b
+        let Some(message) = midi::midi_out_message(P::MIDI_OUTPUT, &event) else {
+            return Err((
+                event,
+                SendEventError::InvalidEvent {
+                    midi_output_config: P::MIDI_OUTPUT,
+                },
+            ));
+        };
+
+        let bytes: &[u8] = match &message {
+            MidiResult::Basic(bytes) => &bytes[..],
+            MidiResult::SysEx(buffer, length) => {
+                match Borrow::<[u8]>::borrow(buffer).get(..*length) {
+                    Some(bytes) => bytes,
+                    // A SysEx message that claims to be longer than its own buffer
+                    None => {
+                        return Err((
+                            event,
+                            SendEventError::InvalidEvent {
+                                midi_output_config: P::MIDI_OUTPUT,
+                            },
+                        ))
+                    }
+                }
+            }
+        };
+
+        let start = self.output_bytes.len();
+        if start + bytes.len() > self.output_bytes.capacity()
+            || self.output_events.len() >= self.output_events.capacity()
+        {
+            return Err((event, SendEventError::HostBufferFull));
+        }
+
+        self.output_bytes.extend_from_slice(bytes);
+        self.output_events
+            .push((event.timing(), start as u32, bytes.len() as u32));
+
+        Ok(())
     }
 
     fn set_latency_samples(&self, samples: u32) {

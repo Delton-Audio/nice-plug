@@ -11,6 +11,9 @@ use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 
+// DELTON FORK DELTA: au-4b
+use nice_plug_core::midi::MidiConfig;
+
 use super::convert::{four_cc_valid, manufacturer_valid};
 use super::sys::*;
 use super::wrapper::Wrapper;
@@ -214,6 +217,14 @@ unsafe extern "C-unwind" fn lookup<P: AuPlugin>(selector: i16) -> AudioComponent
                 method(render::<P> as unsafe extern "C-unwind" fn(_, _, _, _, _, _) -> _)
             }
             SELECT_RESET => method(reset::<P> as unsafe extern "C-unwind" fn(_, _, _) -> _),
+            // DELTON FORK DELTA: au-4b: without MIDI input the host sees no MIDI methods
+            SELECT_MIDI_EVENT if P::MIDI_INPUT != MidiConfig::None => {
+                method(midi_event::<P> as unsafe extern "C-unwind" fn(_, _, _, _, _) -> _)
+            }
+            // DELTON FORK DELTA: au-4b
+            SELECT_SYSEX if P::MIDI_INPUT != MidiConfig::None => {
+                method(sysex::<P> as unsafe extern "C-unwind" fn(_, _, _) -> _)
+            }
             _ => None,
         }
     }
@@ -381,6 +392,31 @@ unsafe extern "C-unwind" fn reset<P: AuPlugin>(
     _element: AudioUnitElement,
 ) -> OSStatus {
     unsafe { guarded::<P>(this, PARAM_ERR, |wrapper| wrapper.reset()) }
+}
+
+// DELTON FORK DELTA: au-4b
+unsafe extern "C-unwind" fn midi_event<P: AuPlugin>(
+    this: *mut c_void,
+    status: u32,
+    data1: u32,
+    data2: u32,
+    offset: u32,
+) -> OSStatus {
+    unsafe {
+        guarded::<P>(this, PARAM_ERR, |wrapper| {
+            wrapper.midi_event(status, data1, data2, offset)
+        })
+    }
+}
+
+// DELTON FORK DELTA: au-4b
+unsafe extern "C-unwind" fn sysex<P: AuPlugin>(
+    this: *mut c_void,
+    data: *const u8,
+    length: u32,
+) -> OSStatus {
+    // SAFETY: The host passes `length` bytes at `data`; a null `data` is refused.
+    unsafe { guarded::<P>(this, PARAM_ERR, |wrapper| wrapper.sysex(data, length)) }
 }
 
 unsafe extern "C-unwind" fn render<P: AuPlugin>(

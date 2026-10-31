@@ -11,6 +11,8 @@ pub(crate) mod render_check;
 pub(crate) mod view_names;
 // DELTON FORK DELTA: au-4a
 pub(crate) mod workgroup;
+// DELTON FORK DELTA: au-4b
+pub(crate) mod midi;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod buffers;

@@ -24,6 +24,8 @@ use nice_plug_core::editor::dpi::{NativeSize, Size};
 // DELTON FORK DELTA: au-2
 #[cfg(feature = "editor")]
 use nice_plug_core::editor::{Editor, EditorHandle, SpawnedEditor};
+// DELTON FORK DELTA: au-4b
+use nice_plug_core::midi::{MidiConfig, NoteEvent, PluginNoteEvent};
 use nice_plug_core::params::internals::ParamPtr;
 use nice_plug_core::params::{ParamFlags, Params};
 use nice_plug_core::plugin::{PluginState, ProcessStatus, TaskExecutor};
@@ -50,6 +52,8 @@ use super::layout::{
     au_layouts, channels_allowed, element_channels, pick_layout, supported_channels, ChannelPair,
     ElementShape,
 };
+// DELTON FORK DELTA: au-4b
+use super::midi;
 use super::param_table::{au_from_normalized, normalized_from_au, AuParamKind, AuParamTable};
 use super::render_check::{check_render, RenderCheck, RenderError};
 use super::state;
@@ -76,6 +80,9 @@ const PROPERTY_LISTENER_CAPACITY: usize = 32;
 const RENDER_NOTIFY_SLOTS: usize = 8;
 /// The `kRenderQuality_Max` value: what `RenderQuality` reports.
 const RENDER_QUALITY: u32 = kRenderQuality_Max;
+// DELTON FORK DELTA: au-4b
+/// The bytes of outgoing MIDI one block can hold, and the size of the packet list CoreMIDI builds.
+const MIDI_OUT_BYTES: usize = 64 * 1024;
 
 /// Tasks that can be sent from the plugin or the host threads to be executed on the main thread in
 /// a non-blocking realtime-safe way (the OS' message loop on macOS).
@@ -150,6 +157,15 @@ struct HostCallbacks {
     beat_and_tempo: HostCallback_GetBeatAndTempo,
     musical_time_location: HostCallback_GetMusicalTimeLocation,
     transport_state2: HostCallback_GetTransportState2,
+}
+
+// DELTON FORK DELTA: au-4b
+/// The host's MIDI output callback (`kAudioUnitProperty_MIDIOutputCallback`). The user data pointer
+/// is kept as `usize` so this is `Send`.
+#[derive(Clone, Copy, Default)]
+struct MidiOutputCallback {
+    proc: Option<MidiOutputProc>,
+    user_data: usize,
 }
 
 /// One property listener.
@@ -295,6 +311,12 @@ enum Prop {
     Private,
     // DELTON FORK DELTA: au-4a
     RenderContextObserver,
+    // DELTON FORK DELTA: au-4b
+    InstrumentCount,
+    // DELTON FORK DELTA: au-4b
+    MidiOutputCallbackInfo,
+    // DELTON FORK DELTA: au-4b
+    MidiOutputCallback,
     // DELTON FORK DELTA: au-2
     #[cfg(feature = "editor")]
     CocoaUI,
@@ -348,6 +370,12 @@ impl Prop {
             PRIVATE_WRAPPER_PROPERTY => Prop::Private,
             // DELTON FORK DELTA: au-4a
             kAudioUnitProperty_RenderContextObserver => Prop::RenderContextObserver,
+            // DELTON FORK DELTA: au-4b
+            kMusicDeviceProperty_InstrumentCount => Prop::InstrumentCount,
+            // DELTON FORK DELTA: au-4b
+            kAudioUnitProperty_MIDIOutputCallbackInfo => Prop::MidiOutputCallbackInfo,
+            // DELTON FORK DELTA: au-4b
+            kAudioUnitProperty_MIDIOutputCallback => Prop::MidiOutputCallback,
             // DELTON FORK DELTA: au-2
             #[cfg(feature = "editor")]
             kAudioUnitProperty_CocoaUI => Prop::CocoaUI,
@@ -385,6 +413,8 @@ impl Prop {
                 | Prop::PresentPreset
                 | Prop::RenderQuality
                 | Prop::OfflineRender
+                // DELTON FORK DELTA: au-4b
+                | Prop::MidiOutputCallback
         )
     }
 }
@@ -481,6 +511,28 @@ pub(crate) struct Wrapper<P: AuPlugin> {
     param_events: ArrayQueue<(u32, u32, f32)>,
     automation_overflowed: AtomicBool,
     raw_automation: AtomicRefCell<RawAutomation>,
+
+    // DELTON FORK DELTA: au-4b
+    /// MIDI from `MusicDeviceMIDIEvent` / `MusicDeviceSysEx`, any thread, drained at the next render.
+    midi_in: ArrayQueue<PluginNoteEvent<P>>,
+    // DELTON FORK DELTA: au-4b
+    /// Set when `midi_in` was full; the next render logs once and clears it.
+    midi_in_overflowed: AtomicBool,
+    // DELTON FORK DELTA: au-4b
+    /// This block's input events, sorted, read by `next_event`. Capacity `event_capacity`.
+    midi_in_block: AtomicRefCell<Vec<PluginNoteEvent<P>>>,
+    // DELTON FORK DELTA: au-4b
+    /// The host's MIDI output callback.
+    midi_output: AtomicCell<MidiOutputCallback>,
+    // DELTON FORK DELTA: au-4b
+    /// What `try_send_event` queued this block: (timing, message start in `midi_out_bytes`, length).
+    midi_out_block: AtomicRefCell<Vec<(u32, u32, u32)>>,
+    // DELTON FORK DELTA: au-4b
+    /// The bytes of this block's outgoing messages. Capacity 64 KiB.
+    midi_out_bytes: AtomicRefCell<Vec<u8>>,
+    // DELTON FORK DELTA: au-4b
+    /// The MIDIPacketList CoreMIDI builds. 64 KiB, u64-aligned (a `Vec<u64>` of 8192).
+    midi_out_packets: AtomicRefCell<Vec<u64>>,
 
     /// The plugin is able to restore state through a method on the `GuiContext`. To avoid changing
     /// parameters mid-processing, the restoring happens at the end of each render: the audio thread
@@ -585,6 +637,18 @@ impl<P: AuPlugin> Wrapper<P> {
             P::INPUT_EVENT_CAPACITY
         };
 
+        // DELTON FORK DELTA: au-4b
+        let midi_in_capacity = if P::MIDI_INPUT == MidiConfig::None {
+            1
+        } else {
+            event_capacity
+        };
+        let (midi_out_capacity, midi_out_bytes_capacity) = if P::MIDI_OUTPUT == MidiConfig::None {
+            (0, 0)
+        } else {
+            (event_capacity, MIDI_OUT_BYTES)
+        };
+
         // DELTON FORK DELTA: au-4a
         let workgroup = Arc::new(WorkgroupSlot::new());
         let observer_slot = Arc::clone(&workgroup);
@@ -660,6 +724,15 @@ impl<P: AuPlugin> Wrapper<P> {
             } else {
                 0
             })),
+
+            // DELTON FORK DELTA: au-4b (a plugin without MIDI input or output never uses these)
+            midi_in: ArrayQueue::new(midi_in_capacity),
+            midi_in_overflowed: AtomicBool::new(false),
+            midi_in_block: AtomicRefCell::new(Vec::with_capacity(midi_in_capacity)),
+            midi_output: AtomicCell::new(MidiOutputCallback::default()),
+            midi_out_block: AtomicRefCell::new(Vec::with_capacity(midi_out_capacity)),
+            midi_out_bytes: AtomicRefCell::new(Vec::with_capacity(midi_out_bytes_capacity)),
+            midi_out_packets: AtomicRefCell::new(vec![0u64; midi_out_bytes_capacity / 8]),
 
             updated_state_sender,
             updated_state_receiver,
@@ -959,6 +1032,9 @@ impl<P: AuPlugin> Wrapper<P> {
 
     /// `AudioUnitReset`.
     pub(crate) fn reset(&self) -> OSStatus {
+        // DELTON FORK DELTA: au-4b
+        while self.midi_in.pop().is_some() {}
+
         if !self.initialized.load(Ordering::Acquire) {
             return NO_ERR;
         }
@@ -986,6 +1062,47 @@ impl<P: AuPlugin> Wrapper<P> {
         self.last_process_status.store(ProcessStatus::Normal);
 
         NO_ERR
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // MIDI
+    // ----------------------------------------------------------------------------------------
+
+    // DELTON FORK DELTA: au-4b
+    /// `MusicDeviceMIDIEvent`. Any thread; the event is read at the next render. A message the
+    /// plugin's `MIDI_INPUT` does not take is dropped, which is not the host's error.
+    pub(crate) fn midi_event(&self, status: u32, data1: u32, data2: u32, offset: u32) -> OSStatus {
+        let bytes = midi::short_message(status, data1, data2);
+        self.queue_midi_in(offset, &bytes);
+
+        NO_ERR
+    }
+
+    // DELTON FORK DELTA: au-4b
+    /// `MusicDeviceSysEx`. AU gives a SysEx message no sample offset, so it is at offset 0.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be valid for `length` bytes, or null.
+    pub(crate) unsafe fn sysex(&self, data: *const u8, length: u32) -> OSStatus {
+        if data.is_null() || length == 0 {
+            return PARAM_ERR;
+        }
+
+        // SAFETY: Non-null, and the caller guarantees `length` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data, length as usize) };
+        self.queue_midi_in(0, bytes);
+
+        NO_ERR
+    }
+
+    // DELTON FORK DELTA: au-4b
+    fn queue_midi_in(&self, offset: u32, bytes: &[u8]) {
+        if let Some(event) = midi::midi_in_event::<P::SysExMessage>(P::MIDI_INPUT, offset, bytes) {
+            if self.midi_in.push(event).is_err() {
+                self.midi_in_overflowed.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     // ----------------------------------------------------------------------------------------
@@ -1230,6 +1347,18 @@ impl<P: AuPlugin> Wrapper<P> {
     ) -> Result<Prop, OSStatus> {
         let prop = Prop::from_id(id).ok_or(kAudioUnitErr_InvalidProperty)?;
 
+        // DELTON FORK DELTA: au-4b: MIDI properties exist only for a plugin with that MIDI
+        let supported = match prop {
+            Prop::InstrumentCount => P::MIDI_INPUT != MidiConfig::None,
+            Prop::MidiOutputCallbackInfo | Prop::MidiOutputCallback => {
+                P::MIDI_OUTPUT != MidiConfig::None
+            }
+            _ => true,
+        };
+        if !supported {
+            return Err(kAudioUnitErr_InvalidProperty);
+        }
+
         let is_input_or_output = scope == kAudioUnitScope_Input || scope == kAudioUnitScope_Output;
         match prop.scope_rule() {
             ScopeRule::Global => {
@@ -1308,6 +1437,12 @@ impl<P: AuPlugin> Wrapper<P> {
             Prop::FactoryPresets | Prop::ElementName | Prop::Private => size_of::<*const c_void>(),
             // DELTON FORK DELTA: au-4a
             Prop::RenderContextObserver => size_of::<*const c_void>(),
+            // DELTON FORK DELTA: au-4b
+            Prop::InstrumentCount => size_of::<u32>(),
+            // DELTON FORK DELTA: au-4b
+            Prop::MidiOutputCallbackInfo => size_of::<*const c_void>(),
+            // DELTON FORK DELTA: au-4b
+            Prop::MidiOutputCallback => size_of::<MidiOutputCallbackStruct>(),
             Prop::PresentPreset => size_of::<AUPreset>(),
             // DELTON FORK DELTA: au-2
             #[cfg(feature = "editor")]
@@ -1675,6 +1810,22 @@ impl<P: AuPlugin> Wrapper<P> {
             Prop::RenderContextObserver => {
                 put!(RcBlock::as_ptr(&self.render_context_observer.0) as *const c_void)
             }
+            // DELTON FORK DELTA: au-4b
+            Prop::InstrumentCount => put!(0u32),
+            // DELTON FORK DELTA: au-4b
+            Prop::MidiOutputCallbackInfo => {
+                let names = [CFString::from_str("MIDI Out")];
+                let array = CFArray::<CFString>::from_retained_objects(&names);
+                put!(CFRetained::into_raw(array).as_ptr() as *const c_void)
+            }
+            // DELTON FORK DELTA: au-4b
+            Prop::MidiOutputCallback => {
+                let stored = self.midi_output.load();
+                put!(MidiOutputCallbackStruct {
+                    proc: stored.proc,
+                    user_data: stored.user_data as *mut c_void,
+                })
+            }
             // DELTON FORK DELTA: au-2
             #[cfg(feature = "editor")]
             Prop::CocoaUI => match view::cocoa_view_info::<P>() {
@@ -1869,6 +2020,14 @@ impl<P: AuPlugin> Wrapper<P> {
                     transport_state2: info.transportStateProc2,
                 });
             }
+            // DELTON FORK DELTA: au-4b
+            Prop::MidiOutputCallback => {
+                let callback = take!(MidiOutputCallbackStruct);
+                self.midi_output.store(MidiOutputCallback {
+                    proc: callback.proc,
+                    user_data: callback.user_data as usize,
+                });
+            }
             Prop::InPlaceProcessing | Prop::RenderQuality => {
                 // Accepted and ignored
                 let _ = take!(u32);
@@ -1932,6 +2091,10 @@ impl<P: AuPlugin> Wrapper<P> {
             | Prop::Private => return kAudioUnitErr_PropertyNotWritable,
             // DELTON FORK DELTA: au-4a
             Prop::RenderContextObserver => return kAudioUnitErr_PropertyNotWritable,
+            // DELTON FORK DELTA: au-4b
+            Prop::InstrumentCount | Prop::MidiOutputCallbackInfo => {
+                return kAudioUnitErr_PropertyNotWritable;
+            }
             // DELTON FORK DELTA: au-2
             #[cfg(feature = "editor")]
             Prop::CocoaUI => return kAudioUnitErr_PropertyNotWritable,
@@ -2134,6 +2297,23 @@ impl<P: AuPlugin> Wrapper<P> {
             self.automation_overflowed.store(false, Ordering::Relaxed);
         }
 
+        // DELTON FORK DELTA: au-4b
+        if P::MIDI_INPUT != MidiConfig::None {
+            if let Ok(mut events) = self.midi_in_block.try_borrow_mut() {
+                events.clear();
+                while let Some(mut event) = self.midi_in.pop() {
+                    midi::clamp_timing(&mut event, frames);
+                    if events.len() < events.capacity() {
+                        events.push(event);
+                    }
+                }
+                midi::sort_by_timing(&mut events, NoteEvent::timing);
+            }
+            if self.midi_in_overflowed.swap(false, Ordering::Relaxed) {
+                crate::nice_warn!("AU: MIDI input overflowed, some events were dropped");
+            }
+        }
+
         // Without a bypass parameter, a bypassed unit is a copy
         if self.bypassed.load(Ordering::Relaxed) && self.bypass_id.is_none() {
             buffers.copy_main_input_to_output(frames);
@@ -2176,6 +2356,16 @@ impl<P: AuPlugin> Wrapper<P> {
             return NO_ERR;
         };
 
+        // DELTON FORK DELTA: au-4b
+        let (Ok(mut output_events), Ok(mut output_bytes)) = (
+            self.midi_out_block.try_borrow_mut(),
+            self.midi_out_bytes.try_borrow_mut(),
+        ) else {
+            return kAudioUnitErr_CannotDoInCurrentContext;
+        };
+        output_events.clear();
+        output_bytes.clear();
+
         let status = {
             let mut aux = AuxiliaryBuffers {
                 inputs: created.aux_inputs,
@@ -2185,11 +2375,21 @@ impl<P: AuPlugin> Wrapper<P> {
                 inner: self,
                 raw_automation_guard: self.raw_automation.borrow(),
                 transport,
+                // DELTON FORK DELTA: au-4b
+                input_events: self.midi_in_block.borrow(),
+                next_input: 0,
+                output_events,
+                output_bytes,
             };
 
             process_wrapper(|| plugin.process(created.main_buffer, &mut aux, &mut context))
         };
         drop(plugin);
+
+        // DELTON FORK DELTA: au-4b
+        if P::MIDI_OUTPUT != MidiConfig::None {
+            self.flush_midi_out(timestamp);
+        }
 
         self.last_process_status.store(status);
         if let ProcessStatus::Error(message) = status {
@@ -2223,6 +2423,92 @@ impl<P: AuPlugin> Wrapper<P> {
         }
 
         NO_ERR
+    }
+
+    // DELTON FORK DELTA: au-4b
+    /// Hand the MIDI the plugin sent this block to the host's output callback, as CoreMIDI packet
+    /// lists whose packet timestamps are the messages' sample offsets in this block (JUCE's
+    /// convention, which Logic reads). Clears what was queued.
+    fn flush_midi_out(&self, timestamp: *const AudioTimeStamp) {
+        let (Ok(mut block), Ok(mut bytes), Ok(mut packets)) = (
+            self.midi_out_block.try_borrow_mut(),
+            self.midi_out_bytes.try_borrow_mut(),
+            self.midi_out_packets.try_borrow_mut(),
+        ) else {
+            return;
+        };
+
+        let callback = self.midi_output.load();
+        let Some(proc) = callback.proc else {
+            block.clear();
+            bytes.clear();
+            return;
+        };
+        if block.is_empty() {
+            bytes.clear();
+            return;
+        }
+
+        midi::sort_by_timing(&mut block, |message| message.0);
+
+        let user_data = callback.user_data as *mut c_void;
+        let list = packets.as_mut_ptr() as *mut c_void;
+        let size = packets.len() * size_of::<u64>();
+        // SAFETY: `list` is `size` bytes, 8-aligned, and nothing else uses `packets` meanwhile.
+        let mut current = unsafe { MIDIPacketListInit(list) };
+        let mut pending = false;
+        for &(timing, start, length) in block.iter() {
+            let Some(message) = bytes.get(start as usize..(start + length) as usize) else {
+                continue;
+            };
+
+            // SAFETY: `current` is the pointer CoreMIDI last gave for `list`, and `message` holds
+            // `length` bytes.
+            let mut next = unsafe {
+                MIDIPacketListAdd(
+                    list,
+                    size,
+                    current,
+                    timing as u64,
+                    message.len(),
+                    message.as_ptr(),
+                )
+            };
+            if next.is_null() {
+                // The list is full: hand over what it holds and start a new one
+                if pending {
+                    // SAFETY: The callback is the host's and gets the list CoreMIDI built.
+                    unsafe { proc(user_data, timestamp, 0, list) };
+                    pending = false;
+                }
+                // SAFETY: As above.
+                current = unsafe { MIDIPacketListInit(list) };
+                // SAFETY: As above.
+                next = unsafe {
+                    MIDIPacketListAdd(
+                        list,
+                        size,
+                        current,
+                        timing as u64,
+                        message.len(),
+                        message.as_ptr(),
+                    )
+                };
+                if next.is_null() {
+                    // One message larger than the whole list
+                    continue;
+                }
+            }
+            current = next;
+            pending = true;
+        }
+        if pending {
+            // SAFETY: The callback is the host's and gets the list CoreMIDI built.
+            unsafe { proc(user_data, timestamp, 0, list) };
+        }
+
+        block.clear();
+        bytes.clear();
     }
 
     /// The transport the plugin sees, from the host's callbacks. A callback that is absent or that

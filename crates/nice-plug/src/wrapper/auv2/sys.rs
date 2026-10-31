@@ -40,6 +40,11 @@ pub(crate) use objc2_audio_toolbox::{
     AudioUnitScope, HostCallbackInfo, HostCallback_GetBeatAndTempo,
     HostCallback_GetMusicalTimeLocation, HostCallback_GetTransportState2,
 };
+// DELTON FORK DELTA: au-4b
+pub(crate) use objc2_audio_toolbox::{
+    kAudioUnitProperty_MIDIOutputCallback, kAudioUnitProperty_MIDIOutputCallbackInfo,
+    kMusicDeviceMIDIEventSelect, kMusicDeviceProperty_InstrumentCount, kMusicDeviceSysExSelect,
+};
 pub(crate) use objc2_core_audio_types::{
     kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
     kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM, AudioBuffer,
@@ -94,6 +99,10 @@ pub(crate) const SELECT_SET_PARAMETER: i16 = kAudioUnitSetParameterSelect as i16
 pub(crate) const SELECT_SCHEDULE_PARAMETERS: i16 = kAudioUnitScheduleParametersSelect as i16;
 pub(crate) const SELECT_RENDER: i16 = kAudioUnitRenderSelect as i16;
 pub(crate) const SELECT_RESET: i16 = kAudioUnitResetSelect as i16;
+// DELTON FORK DELTA: au-4b
+pub(crate) const SELECT_MIDI_EVENT: i16 = kMusicDeviceMIDIEventSelect as i16;
+// DELTON FORK DELTA: au-4b
+pub(crate) const SELECT_SYSEX: i16 = kMusicDeviceSysExSelect as i16;
 
 /// A render callback / render notify, with C's nullable pointers. The generated `AURenderCallback`
 /// declares the refcon and the flags as `NonNull`, but C hosts pass a null refcon for callbacks that
@@ -106,6 +115,40 @@ pub(crate) type RenderProc = unsafe extern "C-unwind" fn(
     u32,
     *mut AudioBufferList,
 ) -> OSStatus;
+
+// DELTON FORK DELTA: au-4b. AudioUnitProperties.h / CoreMIDI MIDIServices.h.
+/// `AUMIDIOutputCallback`, with C's nullable pointers. `packet_list` is a `const MIDIPacketList*`.
+pub(crate) type MidiOutputProc = unsafe extern "C-unwind" fn(
+    user_data: *mut c_void,
+    timestamp: *const AudioTimeStamp,
+    midi_out_num: u32,
+    packet_list: *const c_void,
+) -> OSStatus;
+
+// DELTON FORK DELTA: au-4b
+/// `AUMIDIOutputCallbackStruct`, with a nullable user data pointer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct MidiOutputCallbackStruct {
+    pub proc: Option<MidiOutputProc>,
+    pub user_data: *mut c_void,
+}
+
+// DELTON FORK DELTA: au-4b
+// MIDIPacketList and MIDIPacket are opaque here: CoreMIDI builds them (their layout is packed and
+// differs between arm64 and x86_64).
+#[link(name = "CoreMIDI", kind = "framework")]
+unsafe extern "C" {
+    pub(crate) fn MIDIPacketListInit(list: *mut c_void) -> *mut c_void;
+    pub(crate) fn MIDIPacketListAdd(
+        list: *mut c_void,
+        list_size: usize,
+        current: *mut c_void,
+        time: u64,
+        length: usize,
+        data: *const u8,
+    ) -> *mut c_void;
+}
 
 /// A property listener, with C's nullable user data pointer (see [`RenderProc`]).
 pub(crate) type PropertyListenerProc = unsafe extern "C-unwind" fn(

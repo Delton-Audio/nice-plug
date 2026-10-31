@@ -1,0 +1,13 @@
+# DELTON FORK DELTA (au-4b): the AU identities of the fork examples CI validates with auval.
+[sine]
+au_type = "aumu"
+au_subtype = "NSin"
+au_manufacturer = "Nplg"
+au_name = "Nice: Sine"
+
+[poly_mod_synth]
+au_type = "aumf"
+au_subtype = "PMSy"
+au_manufacturer = "Nplg"
+au_name = "Nice: Poly Mod Synth"
+

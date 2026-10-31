@@ -136,6 +136,8 @@ block2 = { version = "0.6.2", optional = true }
 objc2-audio-toolbox = { version = "0.3.2", optional = true, default-features = false, features = [
   "std", "AUComponent", "AudioComponent", "AudioUnitProperties", "AudioUnitParameters",
   "AudioUnitUtilities", "objc2-core-audio-types", "objc2-core-foundation", "bitflags",
+  # DELTON FORK DELTA (au-4b): the MusicDevice MIDI selectors
+  "MusicDevice",
 ] }
 objc2-core-audio-types = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CoreAudioBaseTypes", "bitflags"] }
 objc2-core-foundation = { version = "0.3.2", optional = true, default-features = false, features = [

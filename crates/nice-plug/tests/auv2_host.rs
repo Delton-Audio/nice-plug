@@ -38,6 +38,11 @@ use objc2_audio_toolbox::{AudioUnit, AudioUnitAddPropertyListener};
 use objc2_audio_toolbox::{
     kAudioUnitErr_PropertyNotWritable, kAudioUnitProperty_RenderContextObserver,
 };
+// DELTON FORK DELTA: au-4b
+use objc2_audio_toolbox::{
+    kAudioUnitProperty_MIDIOutputCallback, kAudioUnitProperty_MIDIOutputCallbackInfo,
+    kMusicDeviceProperty_InstrumentCount,
+};
 use objc2_core_audio_types::{
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
     kAudioFormatLinearPCM, AudioBuffer, AudioBufferList, AudioStreamBasicDescription,
@@ -984,4 +989,30 @@ fn no_editor_means_no_cocoa_ui() {
         )
     };
     assert_eq!(status, kAudioUnitErr_InvalidProperty);
+}
+
+// DELTON FORK DELTA: au-4b
+#[test]
+fn effect_without_midi_has_no_midi_properties() {
+    // TestGain has `MIDI_INPUT` and `MIDI_OUTPUT` at `None`
+    let unit = Unit::new();
+    for id in [
+        kMusicDeviceProperty_InstrumentCount,
+        kAudioUnitProperty_MIDIOutputCallbackInfo,
+        kAudioUnitProperty_MIDIOutputCallback,
+    ] {
+        let mut size = 0u32;
+        let mut writable = 0u8;
+        let status = unsafe {
+            AudioUnitGetPropertyInfo(
+                unit.0,
+                id,
+                kAudioUnitScope_Global,
+                0,
+                &mut size,
+                &mut writable,
+            )
+        };
+        assert_eq!(status, kAudioUnitErr_InvalidProperty, "property {id}");
+    }
 }
