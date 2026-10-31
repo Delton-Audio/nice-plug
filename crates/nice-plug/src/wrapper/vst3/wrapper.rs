@@ -1,5 +1,5 @@
 use atomic_refcell::AtomicRefMut;
-use nice_plug_core::audio_setup::{AuxiliaryBuffers, BufferConfig, ProcessMode};
+use nice_plug_core::audio_setup::AuxiliaryBuffers;
 // DELTON FORK DELTA
 use nice_plug_core::context::process::{ParamAutomationPoint, Transport};
 #[cfg(feature = "editor")]
@@ -31,8 +31,8 @@ use vst3::Steinberg::Vst::{
     IoMode, MediaType, NoteExpressionTypeID, NoteExpressionTypeInfo, NoteExpressionValue,
     NoteExpressionValueDescription, ParamID, ParamValue, ParameterInfo,
     ParameterInfo_::ParameterFlags_,
-    ProcessData, ProcessModes_, ProcessSetup, ProgramListID, ProgramListInfo, SpeakerArrangement,
-    String128, TChar, UnitID, UnitInfo, kNoParamId, kNoParentUnitId, kNoProgramListId, kRootUnitId,
+    ProcessData, ProcessSetup, ProgramListID, ProgramListInfo, SpeakerArrangement, String128,
+    TChar, UnitID, UnitInfo, kNoParamId, kNoParentUnitId, kNoProgramListId, kRootUnitId,
 };
 use vst3::Steinberg::{
     FIDString, FUnknown, IBStream, IBStreamTrait, IPlugView, IPluginBaseTrait, TBool, TUID, int16,
@@ -43,6 +43,7 @@ use widestring::U16CStr;
 
 use super::inner::{ProcessEvent, WrapperInner};
 use super::note_expressions;
+use super::setup::{buffer_config_for_setup, layout_matches};
 use super::util::{VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START, u16strlcpy};
 use super::util::{VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END};
 use crate::util::permit_alloc;
@@ -841,70 +842,15 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
 
         // nice-plug no longer supports flexible IO layouts. Instead we'll try to find an audio IO
         // layout that matches the host's requested layout.
+        // DELTON FORK DELTA: vst3fix-1 (DEFECTS 248): the matching is `layout_matches`; it skips
+        // the main output check for a layout without a main output, as the input side always did.
+        // SAFETY: The host passes `num_ins` and `num_outs` arrangements, both counts were checked
+        // to be non-negative above, and both pointers were checked for null.
+        let inputs = unsafe { std::slice::from_raw_parts(inputs, num_ins as usize) };
+        let outputs = unsafe { std::slice::from_raw_parts(outputs, num_outs as usize) };
         let matching_layout = P::AUDIO_IO_LAYOUTS
             .iter()
-            .find(|layout| {
-                // If the number of ports/busses doesn't match then we can immediately discard the
-                // layout. VST3 doesn't allow for optional switchable ports like CLAP does. Only the
-                // channel counts can change.
-                let num_layout_ins = if layout.main_input_channels.is_some() {
-                    1
-                } else {
-                    0
-                } + layout.aux_input_ports.len();
-                let num_layout_outs = if layout.main_output_channels.is_some() {
-                    1
-                } else {
-                    0
-                } + layout.aux_output_ports.len();
-                if num_ins as usize != num_layout_ins || num_outs as usize != num_layout_outs {
-                    return false;
-                }
-
-                // NOTE: We completely ignore the speaker arrangements and only look at the channel
-                //       counts here. This may cause issues at some point, but it works for now.
-                let has_main_input = layout.main_input_channels.is_some();
-                // DELTON FORK DELTA: the aux start index was inverted (aux 0 was compared against the main bus).
-                let aux_input_start_idx = if has_main_input { 1 } else { 0 };
-                if has_main_input
-                    && unsafe {
-                        (*inputs).count_ones() != layout.main_input_channels.unwrap().get()
-                    }
-                {
-                    return false;
-                }
-                for (aux_input_idx, channel_count) in layout.aux_input_ports.iter().enumerate() {
-                    if unsafe {
-                        (*inputs.add(aux_input_idx + aux_input_start_idx)).count_ones()
-                            != channel_count.get()
-                    } {
-                        return false;
-                    }
-                }
-
-                let has_main_output = layout.main_output_channels.is_some();
-                // DELTON FORK DELTA: inverted like the input start index above.
-                let aux_output_start_idx = if has_main_output { 1 } else { 0 };
-                if unsafe {
-                    (*outputs).count_ones()
-                        != layout
-                            .main_output_channels
-                            .map(NonZeroU32::get)
-                            .unwrap_or_default()
-                } {
-                    return false;
-                }
-                for (aux_output_idx, channel_count) in layout.aux_output_ports.iter().enumerate() {
-                    if unsafe {
-                        (*outputs.add(aux_output_idx + aux_output_start_idx)).count_ones()
-                            != channel_count.get()
-                    } {
-                        return false;
-                    }
-                }
-
-                true
-            })
+            .find(|layout| layout_matches(layout, inputs, outputs))
             .copied();
 
         match matching_layout {
@@ -998,33 +944,13 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
         crate::nice_debug_assert_eq!(setup.symbolicSampleSize, K_SYMBOLIC_SAMPLE_SIZE_32);
 
         // This is needed when activating the plugin and when restoring state
-        self.inner.current_buffer_config.store(Some(BufferConfig {
-            sample_rate: setup.sampleRate as f32,
-            min_buffer_size: None,
-            max_buffer_size: setup.maxSamplesPerBlock as u32,
-            process_mode: self.inner.current_process_mode.load(),
-        }));
-
-        #[allow(clippy::unnecessary_cast)]
-        const K_REALTIME: i32 = ProcessModes_::kRealtime as i32;
-        #[allow(clippy::unnecessary_cast)]
-        const K_PREFETCH: i32 = ProcessModes_::kPrefetch as i32;
-        #[allow(clippy::unnecessary_cast)]
-        const K_OFFLINE: i32 = ProcessModes_::kOffline as i32;
-
-        let mode = match setup.processMode {
-            n if n == K_REALTIME => ProcessMode::Realtime,
-            n if n == K_PREFETCH => ProcessMode::Buffered,
-            n if n == K_OFFLINE => ProcessMode::Offline,
-            n => {
-                crate::nice_debug_assert_failure!(
-                    "Unknown rendering mode '{}', defaulting to realtime",
-                    n
-                );
-                ProcessMode::Realtime
-            }
-        };
-        self.inner.current_process_mode.store(mode);
+        // DELTON FORK DELTA: vst3fix-1 (DEFECTS 157): the mode is mapped before the config is
+        // stored, so `activate` gets this setup's mode, not the previous one.
+        let buffer_config = buffer_config_for_setup(setup);
+        self.inner.current_buffer_config.store(Some(buffer_config));
+        self.inner
+            .current_process_mode
+            .store(buffer_config.process_mode);
 
         // Initializing the plugin happens in `IAudioProcessor::set_active()` because the host may
         // still change the channel layouts at this point

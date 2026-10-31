@@ -6,11 +6,10 @@ use std::ffi::{CString, c_void};
 use std::mem;
 use std::ptr;
 use std::sync::Weak;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, ThreadId};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::{
-    LibraryLoader::GetModuleHandleA, Performance::QueryPerformanceCounter,
-};
+use windows::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTA, CreateWindowExA, DefWindowProcA, DestroyWindow, GWLP_USERDATA,
     GetWindowLongPtrA, PostMessageA, RegisterClassExA, SetWindowLongPtrA, UnregisterClassA,
@@ -65,6 +64,20 @@ struct HwndWrapper(pub HWND);
 unsafe impl Send for HwndWrapper {}
 unsafe impl Sync for HwndWrapper {}
 
+// DELTON FORK DELTA: vst3fix-1 (DEFECTS 155): the class name came from QueryPerformanceCounter, so
+// two instances created on two threads within one tick collided, and the failed registration's
+// assert aborted the host. A process-wide counter cannot repeat, and this module's own address
+// keeps two nice-plug plugins in one process (each with its own counter) apart.
+static NEXT_CLASS_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A window class name no other event loop in this process uses.
+fn next_class_name() -> CString {
+    let id = NEXT_CLASS_ID.fetch_add(1, Ordering::Relaxed);
+    let module = window_proc as *const () as usize;
+    CString::new(format!("nice-event-loop-{module:x}-{id}"))
+        .expect("Where did these null bytes come from?")
+}
+
 impl<T, E> EventLoop<T, E> for WindowsEventLoop<T, E>
 where
     T: Send + 'static,
@@ -75,10 +88,8 @@ where
 
         // Window classes need to have unique names or else multiple plugins loaded into the same
         // process will end up calling the other plugin's callbacks
-        let mut ticks = 0i64;
-        assert!(unsafe { QueryPerformanceCounter(&mut ticks).is_ok() });
-        let class_name = CString::new(format!("nice-event-loop-{ticks}"))
-            .expect("Where did these null bytes come from?");
+        // DELTON FORK DELTA: vst3fix-1 (DEFECTS 155)
+        let class_name = next_class_name();
         let class_name_ptr = PCSTR(class_name.as_bytes_with_nul().as_ptr());
 
         let class = WNDCLASSEXA {
@@ -239,5 +250,60 @@ unsafe extern "system" fn window_proc(
         }
 
         DefWindowProcA(handle, message, wparam, lparam)
+    }
+}
+
+// DELTON FORK DELTA: vst3fix-1 (DEFECTS 155)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
+
+    struct TestExecutor;
+
+    impl MainThreadExecutor<()> for TestExecutor {
+        fn execute(&self, _task: (), _is_gui_thread: bool) {}
+    }
+
+    #[test]
+    fn class_names_are_unique_across_threads() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| thread::spawn(|| (0..1000).map(|_| next_class_name()).collect::<Vec<_>>()))
+            .collect();
+        let names: HashSet<CString> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        assert_eq!(names.len(), 8000);
+
+        let prefix = format!("nice-event-loop-{:x}-", window_proc as *const () as usize);
+        assert!(
+            names
+                .iter()
+                .all(|n| n.to_str().unwrap().starts_with(&prefix))
+        );
+    }
+
+    #[test]
+    fn event_loops_created_at_once_on_many_threads_all_register() {
+        let barrier = Arc::new(Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let executor = Arc::new(TestExecutor);
+                    barrier.wait();
+                    let loops: Vec<WindowsEventLoop<(), TestExecutor>> = (0..16)
+                        .map(|_| WindowsEventLoop::new_and_spawn(Arc::downgrade(&executor)))
+                        .collect();
+                    // Dropped on the thread that created the windows, as DestroyWindow requires
+                    drop(loops);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("creating an event loop panicked");
+        }
     }
 }

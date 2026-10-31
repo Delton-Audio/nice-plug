@@ -6,6 +6,8 @@ mod factory;
 mod inner;
 mod note_expressions;
 mod param_units;
+// DELTON FORK DELTA: vst3fix-1 (DEFECTS 157, 248)
+mod setup;
 pub mod subcategories;
 mod wrapper;
 

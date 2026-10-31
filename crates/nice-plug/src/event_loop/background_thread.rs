@@ -92,18 +92,25 @@ impl<T: Send + 'static, E: MainThreadExecutor<T> + 'static> WorkerThread<T, E> {
     }
 }
 
+// DELTON FORK DELTA: vst3fix-1 (DEFECTS 180): this runs inside host calls, where a panic aborts the
+// host, so nothing here may panic.
 impl<T, E> Drop for WorkerThread<T, E> {
     fn drop(&mut self) {
-        // The thread is shut down and joined when the handle is dropped
-        self.tasks_sender
-            .send(Message::Shutdown)
-            .expect("Failed while sending worker thread shutdown request");
-        self.join_handle
-            .take()
-            // Only possible if the WorkerThread got dropped twice, somehow?
-            .expect("Missing Worker thread JoinHandle")
-            .join()
-            .expect("Worker thread panicked");
+        let Some(join_handle) = self.join_handle.take() else {
+            return;
+        };
+
+        // The last handle can be dropped on the worker thread itself, by a task that held the last
+        // reference to its plugin instance. A thread cannot join itself: dropping `tasks_sender`
+        // (right after this) disconnects the channel, and the worker exits once it has drained it.
+        if join_handle.thread().id() == thread::current().id() {
+            return;
+        }
+
+        // A failed send means the thread has already exited. A failed join means a task panicked
+        // and ended the thread. Either way there is nothing left to stop.
+        let _ = self.tasks_sender.send(Message::Shutdown);
+        let _ = join_handle.join();
     }
 }
 
@@ -147,12 +154,13 @@ where
         match tasks_receiver.recv() {
             Ok(Message::Task((task, executor))) => match executor.upgrade() {
                 Some(e) => e.execute(task, true),
+                // DELTON FORK DELTA: vst3fix-1 (DEFECTS 180): the worker is shared by every
+                // instance, so a task left behind by a dropped instance is dropped; the thread
+                // keeps serving the others.
                 None => {
                     nice_trace!(
-                        "Received a new task but the executor is no longer alive, shutting down \
-                         worker"
+                        "Received a task for an executor that is no longer alive, dropping it"
                     );
-                    return;
                 }
             },
             Ok(Message::Shutdown) => return,
@@ -164,5 +172,87 @@ where
                 return;
             }
         }
+    }
+}
+
+// DELTON FORK DELTA: vst3fix-1 (DEFECTS 180)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    type Task = Box<dyn FnOnce() + Send>;
+
+    struct SharedWorkerExecutor;
+
+    impl MainThreadExecutor<Task> for SharedWorkerExecutor {
+        fn execute(&self, task: Task, _is_gui_thread: bool) {
+            task()
+        }
+    }
+
+    struct SelfDropExecutor;
+
+    impl MainThreadExecutor<Task> for SelfDropExecutor {
+        fn execute(&self, task: Task, _is_gui_thread: bool) {
+            task()
+        }
+    }
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn a_dead_instances_task_is_dropped_and_the_worker_keeps_serving_the_others() {
+        let live = Arc::new(SharedWorkerExecutor);
+        let dead = Arc::new(SharedWorkerExecutor);
+        let live_bg = BackgroundThread::get_or_create(Arc::downgrade(&live));
+        let dead_bg = BackgroundThread::get_or_create(Arc::downgrade(&dead));
+        assert!(Arc::ptr_eq(&live_bg.worker_thread, &dead_bg.worker_thread));
+
+        // Hold the worker in a task so the dead instance's task is still queued when it dies
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        assert!(live_bg.schedule(Box::new(move || release_rx.recv().unwrap())));
+
+        let (ran_tx, ran_rx) = mpsc::channel::<&'static str>();
+        let dead_ran_tx = ran_tx.clone();
+        assert!(dead_bg.schedule(Box::new(move || dead_ran_tx.send("dead").unwrap())));
+        drop(dead);
+        release_tx.send(()).unwrap();
+
+        assert!(live_bg.schedule(Box::new(move || ran_tx.send("live").unwrap())));
+        assert_eq!(ran_rx.recv_timeout(TIMEOUT), Ok("live"));
+
+        // Dropping the last handles joins the worker; it must not panic
+        drop(dead_bg);
+        drop(live_bg);
+    }
+
+    #[test]
+    fn the_last_handle_dropped_on_the_worker_thread_does_not_hang_or_panic() {
+        let executor = Arc::new(SelfDropExecutor);
+        let holder = Arc::new(Mutex::new(Some(BackgroundThread::get_or_create(
+            Arc::downgrade(&executor),
+        ))));
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let task_holder = holder.clone();
+        let scheduled = holder.lock().as_ref().unwrap().schedule(Box::new(move || {
+            // The last handle to the worker, dropped on the worker itself
+            drop(task_holder.lock().take());
+            done_tx.send(thread::current().id()).unwrap();
+        }));
+        assert!(scheduled);
+
+        let worker_id = done_rx
+            .recv_timeout(TIMEOUT)
+            .expect("the task did not finish");
+        assert_ne!(worker_id, thread::current().id());
+
+        // The map's handle is dead now, so this spawns a fresh worker, which runs tasks
+        let fresh = BackgroundThread::get_or_create(Arc::downgrade(&executor));
+        let (ran_tx, ran_rx) = mpsc::channel();
+        assert!(fresh.schedule(Box::new(move || ran_tx.send(()).unwrap())));
+        assert_eq!(ran_rx.recv_timeout(TIMEOUT), Ok(()));
     }
 }
