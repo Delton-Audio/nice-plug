@@ -3,8 +3,8 @@ mod util;
 
 mod context;
 mod descriptor;
-// DELTON FORK DELTA: hpre-2
 pub mod features;
+// DELTON FORK DELTA: hpre-2
 mod preset_discovery;
 mod wrapper;
 

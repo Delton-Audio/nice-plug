@@ -381,8 +381,8 @@ impl<P: ClapPlugin> HostNoticeSink for ClapHostNotices<P> {
         };
 
         // `post_gui`, never inline: the host runs `loaded` on a later turn of its main loop, like
-        // the rescan
-        // A full queue drops the notice; the host asked nothing of us, so there is nothing to retry
+        // the rescan. A full queue drops the notice; the host asked nothing of us, so there is
+        // nothing to retry
         let _ = wrapper.post_gui(Task::PresetLoaded(path.to_path_buf()));
     }
 }
@@ -3580,9 +3580,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
         };
 
+        // A file holds one preset, indexed with a null load key; a host may hand it back as ""
         if location_kind != CLAP_PRESET_DISCOVERY_LOCATION_FILE
             || location.is_null()
-            || !load_key.is_null()
+            || !(load_key.is_null() || unsafe { *load_key } == 0)
         {
             report_error("only a preset file location, with no load key, can be loaded");
             return false;

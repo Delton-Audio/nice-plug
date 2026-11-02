@@ -28,8 +28,9 @@ pub struct PresetDiscovery {
     pub vendor: String,
     /// The name of the preset file type, `"<plugin name> preset"`.
     pub filetype_name: String,
-    /// The preset files' extension, without the dot.
-    pub extension: String,
+    /// The preset files' extensions, without the dot: the current one first, then any earlier ones
+    /// whose files are still presets. One file type is declared for each.
+    pub extensions: Vec<String>,
     /// Where the presets are. Called once in the provider's `init`; it may write (a backend syncs
     /// its factory presets to disk here).
     pub locations: fn() -> Vec<PresetLocation>,
@@ -256,17 +257,19 @@ unsafe extern "C" fn provider_init(provider: *const clap_preset_discovery_provid
         let locations = (entry.discovery.locations)();
 
         let filetype_name = c_string_truncated(&entry.discovery.filetype_name);
-        let extension = c_string_truncated(&entry.discovery.extension);
-        let filetype = clap_preset_discovery_filetype {
-            name: filetype_name.as_ptr(),
-            description: ptr::null(),
-            file_extension: extension.as_ptr(),
-        };
         let Some(declare_filetype) = indexer.declare_filetype else {
             return false;
         };
-        if !unsafe { declare_filetype(indexer, &filetype) } {
-            return false;
+        for extension in &entry.discovery.extensions {
+            let extension = c_string_truncated(extension);
+            let filetype = clap_preset_discovery_filetype {
+                name: filetype_name.as_ptr(),
+                description: ptr::null(),
+                file_extension: extension.as_ptr(),
+            };
+            if !unsafe { declare_filetype(indexer, &filetype) } {
+                return false;
+            }
         }
 
         let Some(declare_location) = indexer.declare_location else {
@@ -563,7 +566,7 @@ mod tests {
                 name: "Test presets".to_owned(),
                 vendor: "Test".to_owned(),
                 filetype_name: "Test preset".to_owned(),
-                extension: "good".to_owned(),
+                extensions: vec!["good".to_owned(), "older".to_owned()],
                 locations: test_locations,
                 metadata: test_metadata,
             },
@@ -607,7 +610,10 @@ mod tests {
             let rec = record.borrow();
             assert_eq!(
                 rec.filetypes,
-                vec![("Test preset".to_owned(), "good".to_owned())]
+                vec![
+                    ("Test preset".to_owned(), "good".to_owned()),
+                    ("Test preset".to_owned(), "older".to_owned())
+                ]
             );
             assert_eq!(
                 rec.locations,
