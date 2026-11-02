@@ -283,6 +283,11 @@ impl<P: Vst3Plugin> HostNoticeSink for Vst3HostNotices<P> {
             }
         }
     }
+
+    // DELTON FORK DELTA: hpre-2
+    fn preset_loaded(&self, _path: &std::path::Path) {
+        // VST3 has no preset-browser hook for this; the program list (hpre-3) tells the host.
+    }
 }
 
 impl<P: Vst3Plugin> WrapperInner<P> {

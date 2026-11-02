@@ -35,6 +35,8 @@ pub use crate::context::remote_controls::{
 pub use crate::editor::{Editor, Modifiers, ParentWindowHandle, ResizeHint, VirtualKeyCode};
 // DELTON FORK DELTA: hpre-1
 pub use crate::host_notices::{HostNoticeSink, HostNotices};
+// DELTON FORK DELTA: hpre-2
+pub use crate::host_presets::HostPresets;
 pub use crate::midi::sysex::SysExMessage;
 pub use crate::midi::{MidiConfig, NoteEvent, PluginNoteEvent, control_change};
 pub use crate::params::Params;
@@ -49,6 +51,8 @@ pub use crate::plugin::{Plugin, ProcessStatus, TaskExecutor};
 pub use crate::plugin::{TrackColor, TrackInfo};
 pub use crate::wrapper::clap::features::ClapFeature;
 pub use crate::wrapper::clap::{ClapPlugin, PolyModulationConfig};
+// DELTON FORK DELTA: hpre-2
+pub use crate::wrapper::clap::{PresetContent, PresetDiscovery, PresetLocation, PresetMetadata};
 #[cfg(feature = "vst3")]
 pub use crate::wrapper::vst3::Vst3Plugin;
 // DELTON FORK DELTA (au-1)

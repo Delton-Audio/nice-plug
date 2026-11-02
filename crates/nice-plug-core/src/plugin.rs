@@ -16,6 +16,7 @@ use crate::{
     buffer::Buffer,
     context::{activate::ActivateContext, process::ProcessContext},
     host_notices::HostNotices,
+    host_presets::HostPresets,
     midi::{MidiConfig, sysex::SysExMessage},
     params::Params,
 };
@@ -228,6 +229,15 @@ pub trait Plugin: Default + Send + 'static {
     /// The handle is cheap to clone and may be used from any thread. Defaults to dropping it.
     // DELTON FORK DELTA: hpre-1
     fn attach_host_notices(&mut self, notices: HostNotices) {}
+
+    /// The plugin's presets as the host's own preset UI uses them, if it has any. Asked once by each
+    /// wrapper that uses it, right after [`attach_host_notices()`][Self::attach_host_notices()], and
+    /// kept: a host load goes through the returned handle and never locks the plugin. Defaults to
+    /// none.
+    // DELTON FORK DELTA: hpre-2
+    fn host_presets(&self) -> Option<Arc<dyn HostPresets>> {
+        None
+    }
 
     /// The plugin's parameters. The host will update the parameter values before calling
     /// `process()`. These string parameter IDs parameters should never change as they are used to

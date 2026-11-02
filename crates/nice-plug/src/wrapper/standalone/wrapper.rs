@@ -125,6 +125,11 @@ struct NoHostNotices;
 
 impl HostNoticeSink for NoHostNotices {
     fn param_values_changed(&self) {}
+
+    // DELTON FORK DELTA: hpre-2
+    fn preset_loaded(&self, _path: &std::path::Path) {
+        // No host to tell.
+    }
 }
 
 /// Errors that may arise while initializing the wrapped plugins.

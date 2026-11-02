@@ -2,6 +2,7 @@
 // DELTON FORK DELTA: hpre-1
 
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 /// What a plugin may tell its host with no editor open. Cheap to clone, callable from any thread,
@@ -19,6 +20,11 @@ pub struct HostNotices {
 pub trait HostNoticeSink: Send + Sync {
     /// Parameter values changed without a gesture: the host re-reads every value.
     fn param_values_changed(&self);
+
+    /// The plugin loaded this preset file itself (not the host asking): the host learns which
+    /// preset is loaded. A format with no such notion makes this an explicit no-op.
+    // DELTON FORK DELTA: hpre-2
+    fn preset_loaded(&self, path: &Path);
 }
 
 impl HostNotices {
@@ -32,6 +38,15 @@ impl HostNotices {
     /// notice. Does nothing once the plugin instance is gone.
     pub fn param_values_changed(&self) {
         self.sink.param_values_changed();
+    }
+
+    /// The plugin loaded this preset file itself (its own preset UI, not a host load): the host
+    /// learns which preset is loaded. Never call it for a load the host asked for; the wrapper
+    /// answers that one. Does nothing once the plugin instance is gone, and in formats with no
+    /// such notion.
+    // DELTON FORK DELTA: hpre-2
+    pub fn preset_loaded(&self, path: &Path) {
+        self.sink.preset_loaded(path);
     }
 }
 

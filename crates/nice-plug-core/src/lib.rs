@@ -7,6 +7,8 @@ pub mod context;
 pub mod formatters;
 // DELTON FORK DELTA: hpre-1
 pub mod host_notices;
+// DELTON FORK DELTA: hpre-2
+pub mod host_presets;
 pub mod midi;
 pub mod params;
 pub mod plugin;

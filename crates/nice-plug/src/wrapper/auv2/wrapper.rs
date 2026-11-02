@@ -2964,6 +2964,11 @@ impl<P: AuPlugin> HostNoticeSink for AuHostNotices<P> {
             }
         }
     }
+
+    // DELTON FORK DELTA: hpre-2
+    fn preset_loaded(&self, _path: &std::path::Path) {
+        // AU has no preset-browser hook for this; the factory presets list (hpre-4) tells the host.
+    }
 }
 
 impl<P: AuPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {

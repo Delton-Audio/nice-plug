@@ -75,6 +75,15 @@ use nice_plug_core::context::process::{ParamAutomationPoint, Transport};
 use nice_plug_core::editor::{Editor, SpawnedEditor};
 // DELTON FORK DELTA: hpre-1
 use nice_plug_core::host_notices::{HostNoticeSink, HostNotices};
+// DELTON FORK DELTA: hpre-2
+use clap_sys::ext::preset_load::{
+    CLAP_EXT_PRESET_LOAD, CLAP_EXT_PRESET_LOAD_COMPAT, clap_host_preset_load,
+    clap_plugin_preset_load,
+};
+use clap_sys::factory::preset_discovery::{
+    CLAP_PRESET_DISCOVERY_LOCATION_FILE, clap_preset_discovery_location_kind,
+};
+use nice_plug_core::host_presets::HostPresets;
 use nice_plug_core::midi::{Channel, Key, MidiConfig, NoteEvent, PluginNoteEvent, VoiceID};
 use nice_plug_core::params::internals::ParamPtr;
 use nice_plug_core::params::{ParamFlags, Params};
@@ -85,10 +94,11 @@ use parking_lot::Mutex;
 #[cfg(feature = "editor")]
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, CString, c_void};
 use std::mem;
 use std::num::NonZeroU32;
 use std::os::raw::c_char;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
@@ -260,6 +270,15 @@ pub struct Wrapper<P: ClapPlugin> {
 
     host_thread_check: AtomicRefCell<Option<ClapPtr<clap_host_thread_check>>>,
 
+    /// `clap.preset-load`, answered only when the plugin gave a [`HostPresets`].
+    // DELTON FORK DELTA: hpre-2
+    clap_plugin_preset_load: clap_plugin_preset_load,
+    host_preset_load: AtomicRefCell<Option<ClapPtr<clap_host_preset_load>>>,
+    /// The plugin's presets as the host uses them, asked for once after
+    /// [`HostNotices`] were attached. Kept here so a host load never locks the plugin.
+    // DELTON FORK DELTA: hpre-2
+    host_presets: AtomicRefCell<Option<Arc<dyn HostPresets>>>,
+
     clap_plugin_remote_controls: clap_plugin_remote_controls,
     /// The plugin's remote control pages, if it defines any. Filled when initializing the plugin.
     remote_control_pages: Vec<clap_remote_controls_page>,
@@ -328,6 +347,9 @@ pub enum Task<P: Plugin> {
     VoiceInfoChanged,
     /// Tell the host that it should rescan the current parameter values.
     RescanParamValues,
+    /// Tell the host the plugin loaded this preset file itself (`clap_host_preset_load.loaded`).
+    // DELTON FORK DELTA: hpre-2
+    PresetLoaded(PathBuf),
 }
 
 /// The CLAP end of the plugin's [`HostNotices`]: raises the wrapper's flag, and the call that
@@ -350,6 +372,18 @@ impl<P: ClapPlugin> HostNoticeSink for ClapHostNotices<P> {
             // next notice tries again
             wrapper.param_values_notice.take();
         }
+    }
+
+    // DELTON FORK DELTA: hpre-2
+    fn preset_loaded(&self, path: &Path) {
+        let Some(wrapper) = self.wrapper.upgrade() else {
+            return;
+        };
+
+        // `post_gui`, never inline: the host runs `loaded` on a later turn of its main loop, like
+        // the rescan
+        // A full queue drops the notice; the host asked nothing of us, so there is nothing to retry
+        let _ = wrapper.post_gui(Task::PresetLoaded(path.to_path_buf()));
     }
 }
 
@@ -532,6 +566,23 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                     }
                 }
             }
+            // DELTON FORK DELTA: hpre-2
+            Task::PresetLoaded(path) => match &*self.host_preset_load.borrow() {
+                Some(host_preset_load) => {
+                    crate::nice_debug_assert!(is_gui_thread);
+                    let location = cstring_from_path(&path);
+                    unsafe_clap_call! { host_preset_load=>loaded(
+                        &*self.host_callback,
+                        CLAP_PRESET_DISCOVERY_LOCATION_FILE,
+                        location.as_ptr(),
+                        std::ptr::null(),
+                    ) };
+                }
+                None => {
+                    #[cfg(debug_assertions)]
+                    crate::nice_warn!("Host does not support the preset-load extension");
+                }
+            },
         };
     }
 }
@@ -770,6 +821,13 @@ impl<P: ClapPlugin> Wrapper<P> {
 
             host_thread_check: AtomicRefCell::new(None),
 
+            // DELTON FORK DELTA: hpre-2
+            clap_plugin_preset_load: clap_plugin_preset_load {
+                from_location: Some(Self::ext_preset_load_from_location),
+            },
+            host_preset_load: AtomicRefCell::new(None),
+            host_presets: AtomicRefCell::new(None),
+
             clap_plugin_remote_controls: clap_plugin_remote_controls {
                 count: Some(Self::ext_remote_controls_count),
                 get: Some(Self::ext_remote_controls_get),
@@ -837,6 +895,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             .attach_host_notices(HostNotices::new(Arc::new(ClapHostNotices {
                 wrapper: Arc::downgrade(&wrapper),
             })));
+
+        // Ask for the presets once and keep them, so a host load never locks the plugin.
+        // DELTON FORK DELTA: hpre-2
+        *wrapper.host_presets.borrow_mut() = wrapper.plugin.try_lock().unwrap().host_presets();
 
         // The `clap_plugin::plugin_data` field needs to point to this wrapper so we can access it
         // from the vtable functions
@@ -1816,6 +1878,17 @@ impl<P: ClapPlugin> Wrapper<P> {
                 &wrapper.host_callback,
                 CLAP_EXT_THREAD_CHECK,
             );
+            // DELTON FORK DELTA: hpre-2
+            *wrapper.host_preset_load.borrow_mut() = query_host_extension::<clap_host_preset_load>(
+                &wrapper.host_callback,
+                CLAP_EXT_PRESET_LOAD,
+            )
+            .or_else(|| {
+                query_host_extension::<clap_host_preset_load>(
+                    &wrapper.host_callback,
+                    CLAP_EXT_PRESET_LOAD_COMPAT,
+                )
+            });
         }
 
         #[cfg(feature = "editor")]
@@ -2480,6 +2553,14 @@ impl<P: ClapPlugin> Wrapper<P> {
         } else if id == CLAP_EXT_NOTE_PORTS {
             if P::MIDI_INPUT >= MidiConfig::Basic || P::MIDI_OUTPUT >= MidiConfig::Basic {
                 &wrapper.clap_plugin_note_ports as *const _ as *const c_void
+            } else {
+                std::ptr::null()
+            }
+        } else if id == CLAP_EXT_PRESET_LOAD || id == CLAP_EXT_PRESET_LOAD_COMPAT {
+            // DELTON FORK DELTA: hpre-2
+            // Only a plugin that gave a `HostPresets` has presets the host can load
+            if wrapper.host_presets.borrow().is_some() {
+                &wrapper.clap_plugin_preset_load as *const _ as *const c_void
             } else {
                 std::ptr::null()
             }
@@ -3473,6 +3554,74 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
+    /// `clap.preset-load`: the host picked a preset file in its own browser. Main thread.
+    // DELTON FORK DELTA: hpre-2
+    unsafe extern "C" fn ext_preset_load_from_location(
+        plugin: *const clap_plugin,
+        location_kind: clap_preset_discovery_location_kind,
+        location: *const c_char,
+        load_key: *const c_char,
+    ) -> bool {
+        check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data });
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+
+        // Tell the host why a load failed, if it has the extension to hear it
+        let report_error = |msg: &str| {
+            if let Some(host_preset_load) = &*wrapper.host_preset_load.borrow() {
+                let msg = CString::new(msg.replace('\0', " ")).unwrap_or_default();
+                unsafe_clap_call! { host_preset_load=>on_error(
+                    &*wrapper.host_callback,
+                    location_kind,
+                    location,
+                    load_key,
+                    0,
+                    msg.as_ptr(),
+                ) };
+            }
+        };
+
+        if location_kind != CLAP_PRESET_DISCOVERY_LOCATION_FILE
+            || location.is_null()
+            || !load_key.is_null()
+        {
+            report_error("only a preset file location, with no load key, can be loaded");
+            return false;
+        }
+        // Cloned out so the host's callbacks below never run under the borrow
+        let Some(host_presets) = wrapper.host_presets.borrow().clone() else {
+            report_error("this plugin has no presets to load");
+            return false;
+        };
+
+        let path = PathBuf::from(
+            unsafe { CStr::from_ptr(location) }
+                .to_string_lossy()
+                .as_ref(),
+        );
+        // No panic may cross the C boundary
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host_presets.load_file(&path)
+        }))
+        .unwrap_or_else(|_| Err("the plugin failed while loading the preset".to_owned()));
+        match result {
+            Ok(()) => {
+                if let Some(host_preset_load) = &*wrapper.host_preset_load.borrow() {
+                    unsafe_clap_call! { host_preset_load=>loaded(
+                        &*wrapper.host_callback,
+                        location_kind,
+                        location,
+                        load_key,
+                    ) };
+                }
+                true
+            }
+            Err(msg) => {
+                report_error(&msg);
+                false
+            }
+        }
+    }
+
     unsafe extern "C" fn ext_remote_controls_count(plugin: *const clap_plugin) -> u32 {
         check_null_ptr!(0, plugin, unsafe { (*plugin).plugin_data });
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
@@ -3724,4 +3873,13 @@ unsafe fn query_host_extension<T>(
     } else {
         None
     }
+}
+
+/// A path as the C string the host's `clap_host_preset_load` takes. A path with a NUL in it (not
+/// possible on a real file system) is cut there.
+// DELTON FORK DELTA: hpre-2
+fn cstring_from_path(path: &Path) -> CString {
+    let text = path.to_string_lossy();
+    let end = text.find('\0').unwrap_or(text.len());
+    CString::new(&text.as_bytes()[..end]).unwrap_or_default()
 }

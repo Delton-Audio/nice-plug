@@ -3,16 +3,26 @@ mod util;
 
 mod context;
 mod descriptor;
+// DELTON FORK DELTA: hpre-2
 pub mod features;
+mod preset_discovery;
 mod wrapper;
 
 use crate::wrapper::clap::features::ClapFeature;
 
 /// Re-export for the macro
 pub use self::descriptor::PluginDescriptor;
+// DELTON FORK DELTA: hpre-2
+pub use self::preset_discovery::{
+    PresetContent, PresetDiscovery, PresetDiscoveryFactory, PresetLocation, PresetMetadata,
+};
 pub use self::wrapper::Wrapper;
 pub use clap_sys::entry::clap_plugin_entry;
 pub use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
+// DELTON FORK DELTA: hpre-2
+pub use clap_sys::factory::preset_discovery::{
+    CLAP_PRESET_DISCOVERY_FACTORY_ID, CLAP_PRESET_DISCOVERY_FACTORY_ID_COMPAT,
+};
 pub use clap_sys::host::clap_host;
 pub use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 pub use clap_sys::version::CLAP_VERSION;
@@ -43,6 +53,15 @@ pub trait ClapPlugin: Plugin {
     /// that the host can use to provide better hardware mapping for a plugin. See the linked
     /// extension for more information.
     fn remote_controls(&self, context: &mut impl RemoteControlsContext) {}
+
+    /// Where this plugin's preset files live and how to read one's metadata, so the host's own
+    /// preset browser can list them without creating the plugin. Answers the CLAP preset-discovery
+    /// factory; `None` (the default) means the plugin exports no such factory. No `self`: the host
+    /// asks while indexing, with no plugin instance.
+    // DELTON FORK DELTA: hpre-2
+    fn preset_discovery() -> Option<PresetDiscovery> {
+        None
+    }
 }
 
 /// Configuration for the plugin's polyphonic modulation options, if it supports .
@@ -166,9 +185,43 @@ macro_rules! nice_export_clap {
                 $crate::wrapper::run_module_deinit_hooks();
             }
 
+            // DELTON FORK DELTA: hpre-2
+            // The preset-discovery factory over the exported plugins whose `preset_discovery()` is
+            // `Some`. Built on first use and then fixed in place: the host keeps the pointer.
+            static PRESET_DISCOVERY_FACTORY: OnceLock<$crate::wrapper::clap::PresetDiscoveryFactory> = OnceLock::new();
+
+            fn preset_discovery_factory() -> &'static $crate::wrapper::clap::PresetDiscoveryFactory {
+                PRESET_DISCOVERY_FACTORY.get_or_init(|| {
+                    $crate::wrapper::clap::PresetDiscoveryFactory::new(
+                        [$(
+                            <$plugin_ty as $crate::wrapper::clap::ClapPlugin>::preset_discovery().map(|discovery| {
+                                (<$plugin_ty as $crate::wrapper::clap::ClapPlugin>::CLAP_ID, discovery)
+                            })
+                        ),+]
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                    )
+                })
+            }
+
             pub extern "C" fn get_factory(factory_id: *const c_char) -> *const c_void {
-                if !factory_id.is_null() && unsafe { CStr::from_ptr(factory_id) } == CLAP_PLUGIN_FACTORY_ID {
+                if factory_id.is_null() {
+                    return ::std::ptr::null();
+                }
+                let factory_id = unsafe { CStr::from_ptr(factory_id) };
+                if factory_id == CLAP_PLUGIN_FACTORY_ID {
                     &CLAP_PLUGIN_FACTORY as *const _ as *const c_void
+                } else if factory_id == $crate::wrapper::clap::CLAP_PRESET_DISCOVERY_FACTORY_ID
+                    || factory_id == $crate::wrapper::clap::CLAP_PRESET_DISCOVERY_FACTORY_ID_COMPAT
+                {
+                    // DELTON FORK DELTA: hpre-2
+                    let factory = preset_discovery_factory();
+                    if factory.is_empty() {
+                        ::std::ptr::null()
+                    } else {
+                        factory.as_clap_factory()
+                    }
                 } else {
                     ::std::ptr::null()
                 }
