@@ -385,6 +385,11 @@ impl<P: ClapPlugin> HostNoticeSink for ClapHostNotices<P> {
         // nothing to retry
         let _ = wrapper.post_gui(Task::PresetLoaded(path.to_path_buf()));
     }
+
+    // DELTON FORK DELTA: hpre-3
+    fn program_list_changed(&self) {
+        // CLAP has no program list; its preset browser re-indexes the preset files itself.
+    }
 }
 
 /// The types of CLAP parameter updates for events.
@@ -1604,16 +1609,18 @@ impl<P: ClapPlugin> Wrapper<P> {
                 }
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI) => {
-                // In the Basic note port type, we'll still handle note on, note off, and polyphonic
-                // pressure events if the host sents us those. But we'll throw away any other MIDI
-                // messages to stay consistent with the VST3 wrapper.
+                // In the Basic note port type, we'll still handle note on, note off, polyphonic
+                // pressure and program change events if the host sents us those. But we'll throw
+                // away any other MIDI messages to stay consistent with the VST3 wrapper.
                 let event = unsafe { &*(event as *const clap_event_midi) };
 
                 match NoteEvent::from_midi(timing, &event.data) {
                     Ok(
                         note_event @ (NoteEvent::NoteOn { .. }
                         | NoteEvent::NoteOff { .. }
-                        | NoteEvent::PolyPressure { .. }),
+                        | NoteEvent::PolyPressure { .. }
+                        // DELTON FORK DELTA: hpre-3
+                        | NoteEvent::MidiProgramChange { .. }),
                     ) if P::MIDI_INPUT >= MidiConfig::Basic => {
                         push_event(input_events, note_event);
                     }

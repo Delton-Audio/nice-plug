@@ -46,6 +46,11 @@ use super::note_expressions;
 use super::setup::{buffer_config_for_setup, layout_matches};
 use super::util::{VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START, u16strlcpy};
 use super::util::{VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END};
+// DELTON FORK DELTA: hpre-3
+use super::util::{
+    PROGRAM_LIST_ID, VST3_CTRL_PROGRAM_CHANGE, VST3_PROGRAM_PARAM_ID, program_from_normalized,
+    program_to_normalized,
+};
 use crate::util::permit_alloc;
 use crate::wrapper::state;
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
@@ -604,6 +609,29 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
     }
 }
 
+// DELTON FORK DELTA: hpre-3
+impl<P: Vst3Plugin> Wrapper<P> {
+    /// 1 when the wrapper has the program list and the program parameter, else 0.
+    fn num_program_params(&self) -> i32 {
+        i32::from(self.inner.has_programs())
+    }
+
+    /// Program `index`'s name in the program list: the cached name, or the plugin's name for the
+    /// one program of an empty list (which loads nothing). An index past the list is empty.
+    fn program_name(&self, index: usize) -> String {
+        self.inner
+            .with_program_list(|list| {
+                if list.names.is_empty() {
+                    (index == 0).then(|| P::NAME.to_string())
+                } else {
+                    list.names.get(index).cloned()
+                }
+            })
+            .flatten()
+            .unwrap_or_default()
+    }
+}
+
 impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
     unsafe fn setComponentState(&self, _state: *mut IBStream) -> tresult {
         // We have a single file component, so we don't need to do anything here
@@ -623,18 +651,24 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
     }
 
     unsafe fn getParameterCount(&self) -> int32 {
+        // DELTON FORK DELTA: hpre-3
+        // The program parameter comes right after the plugin's own parameters
+        let num_params = self.inner.param_hashes.len() as i32 + self.num_program_params();
+
         // We need to add a whole bunch of parameters if the plugin accepts MIDI CCs
         if P::MIDI_INPUT >= MidiConfig::MidiCCs {
-            self.inner.param_hashes.len() as i32 + VST3_MIDI_NUM_PARAMS as i32
+            num_params + VST3_MIDI_NUM_PARAMS as i32
         } else {
-            self.inner.param_hashes.len() as i32
+            num_params
         }
     }
 
     unsafe fn getParameterInfo(&self, param_index: int32, info: *mut ParameterInfo) -> tresult {
         check_null_ptr!(info);
 
-        if param_index < 0 || param_index > unsafe { self.getParameterCount() } {
+        // DELTON FORK DELTA: hpre-3: this was `param_index > count`, which let an index one past
+        // the end through (and then panicked indexing `param_hashes`)
+        if param_index < 0 || param_index >= unsafe { self.getParameterCount() } {
             return kInvalidArgument;
         }
 
@@ -644,8 +678,22 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
         // If the parameter is a generated MIDI CC/channel pressure/pitch bend then it needs to be
         // handled separately
         let num_actual_params = self.inner.param_hashes.len() as i32;
-        if P::MIDI_INPUT >= MidiConfig::MidiCCs && param_index >= num_actual_params {
-            let midi_param_relative_idx = (param_index - num_actual_params) as u32;
+        // DELTON FORK DELTA: hpre-3
+        let num_program_params = self.num_program_params();
+        if num_program_params == 1 && param_index == num_actual_params {
+            info.id = VST3_PROGRAM_PARAM_ID;
+            u16strlcpy(&mut info.title, "Program");
+            u16strlcpy(&mut info.shortTitle, "Program");
+            info.stepCount = self.inner.program_step_count();
+            info.defaultNormalizedValue = 0.0;
+            info.unitId = kRootUnitId;
+            // Not `kCanAutomate`: a project does not record preset changes as automation
+            info.flags = ParameterFlags_::kIsProgramChange | ParameterFlags_::kIsList;
+        } else if P::MIDI_INPUT >= MidiConfig::MidiCCs
+            && param_index >= num_actual_params + num_program_params
+        {
+            let midi_param_relative_idx =
+                (param_index - num_actual_params - num_program_params) as u32;
             // This goes up to 130 for the 128 CCs followed by channel pressure and pitch bend
             let midi_cc = midi_param_relative_idx % VST3_MIDI_CCS;
             let midi_channel = midi_param_relative_idx / VST3_MIDI_CCS;
@@ -707,6 +755,14 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
 
         let dest = unsafe { &mut *(string) };
 
+        // DELTON FORK DELTA: hpre-3
+        if id == VST3_PROGRAM_PARAM_ID && self.inner.has_programs() {
+            let step_count = self.inner.program_step_count();
+            let name = self.program_name(program_from_normalized(value_normalized, step_count));
+            u16strlcpy(dest, &name);
+            return kResultOk;
+        }
+
         // TODO: We don't implement these methods at all for our generated MIDI CC parameters,
         //       should be fine right? They should be hidden anyways.
         match self.inner.param_by_hash.get(&id) {
@@ -737,6 +793,22 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
             Err(_) => return kInvalidArgument,
         };
 
+        // DELTON FORK DELTA: hpre-3: the program's name, or its number
+        if id == VST3_PROGRAM_PARAM_ID && self.inner.has_programs() {
+            let step_count = self.inner.program_step_count();
+            let count = step_count as usize + 1;
+            let index = (0..count)
+                .find(|&i| self.program_name(i) == string)
+                .or_else(|| string.trim().parse::<usize>().ok().filter(|&i| i < count));
+            return match index {
+                Some(index) => {
+                    unsafe { *value_normalized = program_to_normalized(index, step_count) };
+                    kResultOk
+                }
+                None => kResultFalse,
+            };
+        }
+
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => {
                 let value = match unsafe { param_ptr.string_to_normalized_value(&string) } {
@@ -756,6 +828,12 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
         id: ParamID,
         value_normalized: ParamValue,
     ) -> ParamValue {
+        // DELTON FORK DELTA: hpre-3: the plain value is the program's index
+        if id == VST3_PROGRAM_PARAM_ID && self.inner.has_programs() {
+            return program_from_normalized(value_normalized, self.inner.program_step_count())
+                as f64;
+        }
+
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => unsafe { param_ptr.preview_plain(value_normalized as f32) as f64 },
             _ => value_normalized,
@@ -763,6 +841,16 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
     }
 
     unsafe fn plainParamToNormalized(&self, id: ParamID, plain_value: ParamValue) -> ParamValue {
+        // DELTON FORK DELTA: hpre-3
+        if id == VST3_PROGRAM_PARAM_ID && self.inner.has_programs() {
+            let index = if plain_value.is_nan() || plain_value < 0.0 {
+                0
+            } else {
+                plain_value.round() as usize
+            };
+            return program_to_normalized(index, self.inner.program_step_count());
+        }
+
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => unsafe { param_ptr.preview_normalized(plain_value as f32) as f64 },
             _ => plain_value,
@@ -770,6 +858,14 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
     }
 
     unsafe fn getParamNormalized(&self, id: ParamID) -> ParamValue {
+        // DELTON FORK DELTA: hpre-3: the current preset's place in the list (0 with none)
+        if id == VST3_PROGRAM_PARAM_ID
+            && let Some(host_presets) = self.inner.host_presets.get()
+        {
+            let current = host_presets.current_program().unwrap_or(0);
+            return program_to_normalized(current, self.inner.program_step_count());
+        }
+
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => unsafe { param_ptr.modulated_normalized_value() as f64 },
             _ => 0.5,
@@ -780,6 +876,16 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
         // If the plugin is currently processing audio, then this parameter change will also be sent
         // to the process function
         if self.inner.is_processing.load(Ordering::SeqCst) {
+            return kResultOk;
+        }
+
+        // DELTON FORK DELTA: hpre-3: setting the program parameter loads the program, as a host
+        // load. This is the main thread and nothing is processing, so it happens now.
+        if id == VST3_PROGRAM_PARAM_ID && self.inner.has_programs() {
+            if !value.is_finite() {
+                return kInvalidArgument;
+            }
+            self.inner.load_program_from_value(value);
             return kResultOk;
         }
 
@@ -1123,6 +1229,9 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
 
                         let mut sample_offset = 0i32;
                         let mut value = 0.0f64;
+                        // DELTON FORK DELTA: hpre-3: the program parameter's last point in this
+                        // queue
+                        let mut program_value: Option<f64> = None;
                         for change_idx in 0..num_changes {
                             if unsafe {
                                 param_change_queue.getPoint(
@@ -1138,7 +1247,18 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     sample_offset as u32,
                                     total_buffer_len as u32,
                                 );
+                                let raw_value = value;
                                 let value = value as f32;
+
+                                // DELTON FORK DELTA: hpre-3: the program parameter loads a
+                                // preset on the main thread. It never reaches the plugin's
+                                // parameters, `raw_automation` or the process events. The queue's
+                                // points are in time order, so the last one is the one that stays.
+                                if param_hash == VST3_PROGRAM_PARAM_ID && self.inner.has_programs()
+                                {
+                                    program_value = Some(raw_value);
+                                    continue;
+                                }
 
                                 // MIDI CC messages, channel pressure, and pitch bend are also sent
                                 // as parameter changes
@@ -1208,6 +1328,10 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     }
                                 }
                             }
+                        }
+                        // DELTON FORK DELTA: hpre-3
+                        if let Some(program_value) = program_value {
+                            self.inner.post_program_change(program_value);
                         }
                     }
                 }
@@ -1676,6 +1800,26 @@ impl<P: Vst3Plugin> IMidiMappingTrait for Wrapper<P> {
         midi_cc_number: CtrlNumber,
         param_id: *mut ParamID,
     ) -> tresult {
+        // DELTON FORK DELTA: hpre-3: MIDI program change selects a program, on any channel
+        if midi_cc_number == VST3_CTRL_PROGRAM_CHANGE {
+            let maps_to_program = bus_index == 0
+                && (0..VST3_MIDI_CHANNELS as i16).contains(&channel)
+                && P::MIDI_INPUT >= MidiConfig::Basic
+                && self
+                    .inner
+                    .host_presets
+                    .get()
+                    .is_some_and(|host_presets| host_presets.midi_program_change());
+            if !maps_to_program {
+                return kResultFalse;
+            }
+
+            check_null_ptr!(param_id);
+            unsafe { *param_id = VST3_PROGRAM_PARAM_ID };
+
+            return kResultOk;
+        }
+
         if P::MIDI_INPUT < MidiConfig::MidiCCs
             || bus_index != 0
             || !(0..VST3_MIDI_CHANNELS as i16).contains(&channel)
@@ -1785,13 +1929,33 @@ impl<P: Vst3Plugin> IProcessContextRequirementsTrait for Wrapper<P> {
 
 impl<P: Vst3Plugin> IUnitInfoTrait for Wrapper<P> {
     unsafe fn getUnitCount(&self) -> int32 {
-        self.inner.param_units.len() as i32
+        // DELTON FORK DELTA: hpre-3: the root unit is declared only when it has the program list
+        self.inner.param_units.len() as i32 + self.num_program_params()
     }
 
     unsafe fn getUnitInfo(&self, unit_index: int32, info: *mut UnitInfo) -> tresult {
         check_null_ptr!(info);
 
-        match self.inner.param_units.info(unit_index as usize) {
+        // DELTON FORK DELTA: hpre-3: with a program list the root unit comes first, carrying it
+        let mut unit_index = unit_index;
+        if self.num_program_params() == 1 {
+            if unit_index == 0 {
+                unsafe { *info = mem::zeroed() };
+                let info = unsafe { &mut *info };
+                info.id = kRootUnitId;
+                info.parentUnitId = kNoParentUnitId;
+                u16strlcpy(&mut info.name, "Root");
+                info.programListId = PROGRAM_LIST_ID;
+
+                return kResultOk;
+            }
+            unit_index -= 1;
+        }
+
+        match usize::try_from(unit_index)
+            .ok()
+            .and_then(|unit_index| self.inner.param_units.info(unit_index))
+        {
             Some((unit_id, unit_info)) => {
                 unsafe { *info = mem::zeroed() };
 
@@ -1808,25 +1972,53 @@ impl<P: Vst3Plugin> IUnitInfoTrait for Wrapper<P> {
     }
 
     unsafe fn getProgramListCount(&self) -> int32 {
-        // TODO: Do we want program lists? Probably not, CLAP doesn't even support them.
-        0
+        // DELTON FORK DELTA: hpre-3: one list, the plugin's presets, when it has any
+        self.num_program_params()
     }
 
-    unsafe fn getProgramListInfo(
-        &self,
-        _list_index: int32,
-        _info: *mut ProgramListInfo,
-    ) -> tresult {
-        kInvalidArgument
+    unsafe fn getProgramListInfo(&self, list_index: int32, info: *mut ProgramListInfo) -> tresult {
+        check_null_ptr!(info);
+
+        if list_index != 0 || !self.inner.has_programs() {
+            return kInvalidArgument;
+        }
+
+        // The host is asking for the list (it builds its program menu now), so read it again: a
+        // preset file added behind the plugin's back shows here, and the host is told
+        self.inner.refresh_program_list();
+
+        unsafe { *info = mem::zeroed() };
+        let info = unsafe { &mut *info };
+        info.id = PROGRAM_LIST_ID;
+        u16strlcpy(&mut info.name, "Presets");
+        // An empty list is one program that loads nothing: a VST3 parameter cannot vanish
+        info.programCount = self.inner.program_step_count() + 1;
+
+        kResultOk
     }
 
     unsafe fn getProgramName(
         &self,
-        _list_id: ProgramListID,
-        _program_index: int32,
-        _name: *mut String128,
+        list_id: ProgramListID,
+        program_index: int32,
+        name: *mut String128,
     ) -> tresult {
-        kInvalidArgument
+        check_null_ptr!(name);
+
+        if list_id != PROGRAM_LIST_ID
+            || !self.inner.has_programs()
+            || program_index < 0
+            || program_index > self.inner.program_step_count()
+        {
+            return kInvalidArgument;
+        }
+
+        u16strlcpy(
+            unsafe { &mut *name },
+            &self.program_name(program_index as usize),
+        );
+
+        kResultOk
     }
 
     unsafe fn getProgramInfo(

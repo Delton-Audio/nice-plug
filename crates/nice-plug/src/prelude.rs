@@ -36,7 +36,7 @@ pub use crate::editor::{Editor, Modifiers, ParentWindowHandle, ResizeHint, Virtu
 // DELTON FORK DELTA: hpre-1
 pub use crate::host_notices::{HostNoticeSink, HostNotices};
 // DELTON FORK DELTA: hpre-2
-pub use crate::host_presets::HostPresets;
+pub use crate::host_presets::{HostPresets, ProgramList};
 pub use crate::midi::sysex::SysExMessage;
 pub use crate::midi::{MidiConfig, NoteEvent, PluginNoteEvent, control_change};
 pub use crate::params::Params;

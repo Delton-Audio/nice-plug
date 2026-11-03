@@ -11,6 +11,8 @@ use nice_plug_core::editor::dpi::Size;
 use nice_plug_core::editor::{Editor, SpawnedEditor};
 // DELTON FORK DELTA: hpre-1
 use nice_plug_core::host_notices::{HostNoticeSink, HostNotices};
+// DELTON FORK DELTA: hpre-3
+use nice_plug_core::host_presets::{HostPresets, ProgramList};
 use nice_plug_core::midi::{MidiConfig, PluginNoteEvent};
 use nice_plug_core::params::internals::ParamPtr;
 use nice_plug_core::params::{ParamFlags, Params};
@@ -22,18 +24,25 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use try_lock::TryLock;
 #[cfg(feature = "editor")]
 use vst3::ComWrapper;
-use vst3::Steinberg::Vst::{IComponentHandler, IComponentHandlerTrait, IEventList, RestartFlags_};
+use vst3::Steinberg::Vst::{
+    IComponentHandler, IComponentHandlerTrait, IEventList, IUnitHandler, IUnitHandlerTrait,
+    RestartFlags_,
+};
 use vst3::Steinberg::{kInvalidArgument, kResultOk, tresult};
 use vst3::{ComPtr, ComRef};
 
 use super::context::{WrapperActivateContext, WrapperProcessContext};
 use super::note_expressions::NoteExpressionController;
 use super::param_units::ParamUnits;
-use super::util::{VST3_MIDI_PARAMS_END, VST3_MIDI_PARAMS_START};
+use super::util::{
+    PROGRAM_LIST_ID, VST3_MIDI_PARAMS_END, VST3_MIDI_PARAMS_START, VST3_PROGRAM_PARAM_ID,
+    program_from_normalized,
+};
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::util::permit_alloc;
 use crate::wrapper::state;
@@ -100,6 +109,27 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// taken by the `ParamValuesNotice` task, so a burst of notices posts one task.
     // DELTON FORK DELTA: hpre-1
     pub param_values_notice: NoticeFlag,
+
+    /// The plugin's presets as the host's program list, asked for once right after
+    /// [`attach_host_notices()`][Plugin::attach_host_notices()]. With `None` the wrapper has no
+    /// program list and no program parameter.
+    // DELTON FORK DELTA: hpre-3
+    pub host_presets: OnceLock<Arc<dyn HostPresets>>,
+    /// The program list as last read, on first use and whenever it changed. Main thread only; the
+    /// audio thread never touches it.
+    // DELTON FORK DELTA: hpre-3
+    pub program_list: Mutex<Option<ProgramList>>,
+    /// The latest program change the audio thread saw: the program parameter's normalized value as
+    /// `f64` bits, or [`NO_PROGRAM_CHANGE`]. Taken by the `ProgramChange` task, which has the
+    /// list's step count to turn it into an index.
+    // DELTON FORK DELTA: hpre-3
+    pub program_change_pending: AtomicU64,
+    /// Raised with a pending program change, so a burst posts one `ProgramChange` task.
+    // DELTON FORK DELTA: hpre-3
+    pub program_change_notice: NoticeFlag,
+    /// Raised when the program list changed, so a burst posts one `ProgramListChanged` task.
+    // DELTON FORK DELTA: hpre-3
+    pub program_list_notice: NoticeFlag,
 
     /// Whether the plugin is currently processing audio. In other words, the last state
     /// `IAudioProcessor::setActive()` has been called with.
@@ -212,6 +242,15 @@ pub enum Task<P: Plugin> {
     /// (`restartComponent(kParamValuesChanged)`). Posted by the plugin's [`HostNotices`].
     // DELTON FORK DELTA: hpre-1
     ParamValuesNotice,
+    /// The audio thread saw the program parameter change: load the latest program the host asked
+    /// for, as a host load.
+    // DELTON FORK DELTA: hpre-3
+    ProgramChange,
+    /// The plugin's program list changed: re-read it, then tell the host
+    /// (`restartComponent(kParamTitlesChanged | kParamValuesChanged)` and
+    /// `IUnitHandler::notifyProgramListChange`).
+    // DELTON FORK DELTA: hpre-3
+    ProgramListChanged,
     // Request the editor to be resized according to its current size. Right now there is no way to
     // handle "denied resize" requests yet.
     #[cfg(feature = "editor")]
@@ -256,6 +295,11 @@ impl<P: Plugin> ProcessEvent<P> {
     }
 }
 
+/// The "no program change pending" value of [`WrapperInner::program_change_pending`]: a NaN, which
+/// the audio thread never stores.
+// DELTON FORK DELTA: hpre-3
+pub const NO_PROGRAM_CHANGE: u64 = u64::MAX;
+
 /// The VST3 end of the plugin's [`HostNotices`]: raises the wrapper's flag, and the call that
 /// raised it posts one `ParamValuesNotice` task.
 // DELTON FORK DELTA: hpre-1
@@ -286,7 +330,16 @@ impl<P: Vst3Plugin> HostNoticeSink for Vst3HostNotices<P> {
 
     // DELTON FORK DELTA: hpre-2
     fn preset_loaded(&self, _path: &std::path::Path) {
-        // VST3 has no preset-browser hook for this; the program list (hpre-3) tells the host.
+        // VST3 has no preset-browser hook for a loaded file. The program parameter's value is the
+        // current preset, so the host re-reads every value (hpre-3).
+        self.param_values_changed();
+    }
+
+    // DELTON FORK DELTA: hpre-3
+    fn program_list_changed(&self) {
+        if let Some(wrapper) = self.wrapper.upgrade() {
+            wrapper.post_program_list_changed();
+        }
     }
 }
 
@@ -339,6 +392,15 @@ impl<P: Vst3Plugin> WrapperInner<P> {
                 }
 
                 bypass_param_exists |= is_bypass;
+
+                // DELTON FORK DELTA: hpre-3
+                if *hash == VST3_PROGRAM_PARAM_ID {
+                    crate::nice_debug_assert_failure!(
+                        "Parameter '{}' collides with the generated program parameter, consider \
+                         giving it a different ID",
+                        id
+                    );
+                }
 
                 if P::MIDI_INPUT >= MidiConfig::MidiCCs
                     && (VST3_MIDI_PARAMS_START..VST3_MIDI_PARAMS_END).contains(hash)
@@ -406,6 +468,12 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             event_loop: AtomicRefCell::new(None),
             // DELTON FORK DELTA: hpre-1
             param_values_notice: NoticeFlag::default(),
+            // DELTON FORK DELTA: hpre-3
+            host_presets: OnceLock::new(),
+            program_list: Mutex::new(None),
+            program_change_pending: AtomicU64::new(NO_PROGRAM_CHANGE),
+            program_change_notice: NoticeFlag::default(),
+            program_list_notice: NoticeFlag::default(),
 
             is_processing: AtomicBool::new(false),
             // DELTON FORK DELTA
@@ -473,6 +541,13 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             .attach_host_notices(HostNotices::new(Arc::new(Vst3HostNotices {
                 wrapper: Arc::downgrade(&wrapper),
             })));
+
+        // Asked once, as the CLAP wrapper does: a host load goes through this handle and never
+        // locks the plugin, which the audio thread may hold
+        // DELTON FORK DELTA: hpre-3
+        if let Some(host_presets) = wrapper.plugin.try_lock().unwrap().host_presets() {
+            let _ = wrapper.host_presets.set(host_presets);
+        }
 
         // The editor also needs to be initialized later so the Async executor can work.
 
@@ -560,6 +635,121 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             host_out_events,
             total_buffer_len: total_buffer_len as u32,
             current_sample_idx: current_sample_idx as u32,
+        }
+    }
+
+    /// Whether the plugin gave a [`HostPresets`], that is, whether this wrapper has a program list
+    /// and a program parameter.
+    // DELTON FORK DELTA: hpre-3
+    pub fn has_programs(&self) -> bool {
+        self.host_presets.get().is_some()
+    }
+
+    /// Runs `f` on the cached program list, reading it from the plugin first when it was never
+    /// read. `None` without [`HostPresets`]. Main thread only.
+    // DELTON FORK DELTA: hpre-3
+    pub fn with_program_list<R>(&self, f: impl FnOnce(&ProgramList) -> R) -> Option<R> {
+        let host_presets = self.host_presets.get()?;
+        if let Some(list) = &*self.program_list.lock() {
+            return Some(f(list));
+        }
+        // Read outside the lock: the plugin may tell us about a change while it answers
+        let fresh = host_presets.program_list();
+        let mut cached = self.program_list.lock();
+        Some(f(cached.get_or_insert(fresh)))
+    }
+
+    /// The program parameter's `stepCount`: the number of programs minus one, 0 for a list of one
+    /// or none.
+    // DELTON FORK DELTA: hpre-3
+    pub fn program_step_count(&self) -> i32 {
+        self.with_program_list(|list| list.names.len().saturating_sub(1) as i32)
+            .unwrap_or(0)
+    }
+
+    /// Read the program list from the plugin again into the cache. Returns whether it differed
+    /// from the cached one (a first read does not count). Does not tell the host. Main thread only.
+    // DELTON FORK DELTA: hpre-3
+    pub fn reread_program_list(&self) -> bool {
+        let Some(host_presets) = self.host_presets.get() else {
+            return false;
+        };
+        let fresh = host_presets.program_list();
+        let mut cached = self.program_list.lock();
+        let changed = cached.as_ref().is_some_and(|old| *old != fresh);
+        *cached = Some(fresh);
+        changed
+    }
+
+    /// Read the program list again (the host is asking for it, which is when a listing that
+    /// changed behind the plugin's back shows). When it differs from the cached one the host is
+    /// told. Main thread only.
+    // DELTON FORK DELTA: hpre-3
+    pub fn refresh_program_list(&self) {
+        if self.reread_program_list() {
+            self.post_program_list_changed();
+        }
+    }
+
+    /// Post one `ProgramListChanged` task, however many notices come before it runs. Callable from
+    /// any thread.
+    // DELTON FORK DELTA: hpre-3
+    pub fn post_program_list_changed(&self) {
+        if self.program_list_notice.raise() {
+            // `post_gui`, never inline: see `Vst3HostNotices::param_values_changed()`
+            let posted = match self.event_loop.borrow().as_ref() {
+                Some(event_loop) => event_loop.post_gui(Task::ProgramListChanged),
+                None => false,
+            };
+            if !posted {
+                self.program_list_notice.take();
+            }
+        }
+    }
+
+    /// Called on the audio thread with the program parameter's last normalized value in a block:
+    /// the latest value wins, and a burst posts one `ProgramChange` task. Allocates nothing.
+    // DELTON FORK DELTA: hpre-3
+    pub fn post_program_change(&self, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        self.program_change_pending
+            .store(value.to_bits(), Ordering::Release);
+        if self.program_change_notice.raise() {
+            // `post_gui`, never inline: the load runs on the main thread, never in `process`
+            let posted = match self.event_loop.borrow().as_ref() {
+                Some(event_loop) => event_loop.post_gui(Task::ProgramChange),
+                None => false,
+            };
+            if !posted {
+                // The queue is full: clear the flag so the next change tries again
+                self.program_change_notice.take();
+            }
+        }
+    }
+
+    /// Load the program a program parameter value selects, as a host load. Does nothing for an
+    /// empty list or an index the cached list does not have. An error from the plugin is logged,
+    /// not shown. Main thread only.
+    // DELTON FORK DELTA: hpre-3
+    pub fn load_program_from_value(&self, value: f64) {
+        let Some(host_presets) = self.host_presets.get() else {
+            return;
+        };
+        let target = self
+            .with_program_list(|list| {
+                if list.names.is_empty() {
+                    return None;
+                }
+                let index = program_from_normalized(value, (list.names.len() - 1) as i32);
+                (index < list.names.len()).then_some((index, list.revision))
+            })
+            .flatten();
+        if let Some((index, revision)) = target
+            && let Err(err) = host_presets.load_program(index, revision)
+        {
+            crate::nice_log!("The host's program change was not loaded: {}", err);
         }
     }
 
@@ -826,6 +1016,41 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
                             kResultOk,
                             "Failed the parameter values changed restart request"
                         );
+                    }
+                }
+            }
+            // DELTON FORK DELTA: hpre-3
+            Task::ProgramChange => {
+                // Clear the flag *before* taking the value, so a change that lands after the take
+                // raises it again and posts a new task
+                self.program_change_notice.take();
+                let pending = self
+                    .program_change_pending
+                    .swap(NO_PROGRAM_CHANGE, Ordering::AcqRel);
+                if pending != NO_PROGRAM_CHANGE {
+                    self.load_program_from_value(f64::from_bits(pending));
+                }
+            }
+            // DELTON FORK DELTA: hpre-3
+            Task::ProgramListChanged => {
+                self.program_list_notice.take();
+                self.reread_program_list();
+                if let Some(handler) = &*self.component_handler.borrow() {
+                    unsafe {
+                        crate::nice_debug_assert!(is_gui_thread);
+                        // The parameter's step count and the program names changed, and so may
+                        // its value (the current preset's place in the list)
+                        let result = handler.restartComponent(
+                            RestartFlags_::kParamTitlesChanged | RestartFlags_::kParamValuesChanged,
+                        );
+                        crate::nice_debug_assert_eq!(
+                            result,
+                            kResultOk,
+                            "Failed the program list changed restart request"
+                        );
+                        if let Some(unit_handler) = handler.cast::<IUnitHandler>() {
+                            unit_handler.notifyProgramListChange(PROGRAM_LIST_ID, -1);
+                        }
                     }
                 }
             }

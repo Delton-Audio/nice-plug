@@ -130,6 +130,11 @@ impl HostNoticeSink for NoHostNotices {
     fn preset_loaded(&self, _path: &std::path::Path) {
         // No host to tell.
     }
+
+    // DELTON FORK DELTA: hpre-3
+    fn program_list_changed(&self) {
+        // No host to tell.
+    }
 }
 
 /// Errors that may arise while initializing the wrapped plugins.

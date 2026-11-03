@@ -25,6 +25,11 @@ pub trait HostNoticeSink: Send + Sync {
     /// preset is loaded. A format with no such notion makes this an explicit no-op.
     // DELTON FORK DELTA: hpre-2
     fn preset_loaded(&self, path: &Path);
+
+    /// The program list changed (a preset was added, renamed or removed): a format with a program
+    /// list tells the host to re-read it. A format with none makes this an explicit no-op.
+    // DELTON FORK DELTA: hpre-3
+    fn program_list_changed(&self);
 }
 
 impl HostNotices {
@@ -47,6 +52,15 @@ impl HostNotices {
     // DELTON FORK DELTA: hpre-2
     pub fn preset_loaded(&self, path: &Path) {
         self.sink.preset_loaded(path);
+    }
+
+    /// The plugin's program list changed (see
+    /// [`HostPresets::program_list()`][crate::host_presets::HostPresets::program_list()]): the
+    /// host re-reads it. Many calls before the host's main thread runs reach the host as one
+    /// notice. Does nothing once the plugin instance is gone, and in formats with no program list.
+    // DELTON FORK DELTA: hpre-3
+    pub fn program_list_changed(&self) {
+        self.sink.program_list_changed();
     }
 }
 

@@ -406,8 +406,10 @@ pub enum NoteEvent<S> {
         /// The CC's value, normalized to `[0, 1]`. Multiply by 127 to get the original raw value.
         value: f32,
     },
-    /// A MIDI program change event, available on [`MidiConfig::MidiCCs`] and up. VST3 plugins
-    /// cannot receive these events.
+    /// A MIDI program change event, available on [`MidiConfig::Basic`] and up in CLAP; VST3
+    /// delivers program changes through the program parameter instead, so a VST3 plugin never
+    /// receives this event.
+    // DELTON FORK DELTA: hpre-3
     MidiProgramChange {
         timing: u32,
         /// The affected channel, in `0..16`.
