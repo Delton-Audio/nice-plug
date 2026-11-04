@@ -39,4 +39,10 @@ pub trait HostPresets: Send + Sync {
     /// Whether MIDI program change selects a program (`[presets] midi_program_change`).
     // DELTON FORK DELTA: hpre-3
     fn midi_program_change(&self) -> bool;
+
+    /// Loads program `index` of the list now, as a PLUGIN load (the plugin tells the host, as for
+    /// any preset it loads itself), the way a MIDI program change does. An `index` past the list
+    /// does nothing.
+    // DELTON FORK DELTA: hpre-3b
+    fn program_change(&self, index: usize);
 }

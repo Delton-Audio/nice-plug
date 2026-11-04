@@ -1610,8 +1610,9 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI) => {
                 // In the Basic note port type, we'll still handle note on, note off, polyphonic
-                // pressure and program change events if the host sents us those. But we'll throw
-                // away any other MIDI messages to stay consistent with the VST3 wrapper.
+                // pressure, program change and bank select (CC 0 and CC 32) events if the host
+                // sents us those. But we'll throw away any other MIDI messages to stay consistent
+                // with the VST3 wrapper.
                 let event = unsafe { &*(event as *const clap_event_midi) };
 
                 match NoteEvent::from_midi(timing, &event.data) {
@@ -1620,7 +1621,12 @@ impl<P: ClapPlugin> Wrapper<P> {
                         | NoteEvent::NoteOff { .. }
                         | NoteEvent::PolyPressure { .. }
                         // DELTON FORK DELTA: hpre-3
-                        | NoteEvent::MidiProgramChange { .. }),
+                        | NoteEvent::MidiProgramChange { .. }
+                        // DELTON FORK DELTA: hpre-3b
+                        | NoteEvent::MidiCC {
+                            cc: 0 | 32,
+                            ..
+                        }),
                     ) if P::MIDI_INPUT >= MidiConfig::Basic => {
                         push_event(input_events, note_event);
                     }

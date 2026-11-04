@@ -47,9 +47,10 @@ use super::setup::{buffer_config_for_setup, layout_matches};
 use super::util::{VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START, u16strlcpy};
 use super::util::{VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END};
 // DELTON FORK DELTA: hpre-3
+use super::inner::MidiPresetChange;
 use super::util::{
-    PROGRAM_LIST_ID, VST3_CTRL_PROGRAM_CHANGE, VST3_PROGRAM_PARAM_ID, program_from_normalized,
-    program_to_normalized,
+    PROGRAM_LIST_ID, VST3_CTRL_PROGRAM_CHANGE, VST3_MIDI_PRESET_NUM_PARAMS, VST3_PROGRAM_PARAM_ID,
+    midi_preset_param, midi_preset_param_id, program_from_normalized, program_to_normalized,
 };
 use crate::util::permit_alloc;
 use crate::wrapper::state;
@@ -413,6 +414,14 @@ impl<P: Vst3Plugin> IComponentTrait for Wrapper<P> {
         // We could call activate in `IAudioProcessor::setup_processing()`, but REAPER will set
         // the bus arrangements between that function and this function. So to be able to handle
         // custom channel layout overrides we need to activate here.
+
+        // The audio thread turns the program parameter's value into an index with the list's step
+        // count, so the list is read on this (main) thread before anything processes
+        // DELTON FORK DELTA: hpre-3b
+        if state != 0 {
+            self.inner.prime_program_list();
+        }
+
         match (state != 0, self.inner.current_buffer_config.load()) {
             (true, Some(buffer_config)) => {
                 // Before initializing the plugin, make sure all smoothers are set the the default values
@@ -616,6 +625,16 @@ impl<P: Vst3Plugin> Wrapper<P> {
         i32::from(self.inner.has_programs())
     }
 
+    /// 48 when the wrapper has the hidden MIDI bank select / program change parameters (hpre-3b),
+    /// else 0. They come right after the program parameter.
+    fn num_midi_preset_params(&self) -> i32 {
+        if self.inner.has_midi_preset_params() {
+            VST3_MIDI_PRESET_NUM_PARAMS as i32
+        } else {
+            0
+        }
+    }
+
     /// Program `index`'s name in the program list: the cached name, or the plugin's name for the
     /// one program of an empty list (which loads nothing). An index past the list is empty.
     fn program_name(&self, index: usize) -> String {
@@ -653,7 +672,9 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
     unsafe fn getParameterCount(&self) -> int32 {
         // DELTON FORK DELTA: hpre-3
         // The program parameter comes right after the plugin's own parameters
-        let num_params = self.inner.param_hashes.len() as i32 + self.num_program_params();
+        let num_params = self.inner.param_hashes.len() as i32
+            + self.num_program_params()
+            + self.num_midi_preset_params();
 
         // We need to add a whole bunch of parameters if the plugin accepts MIDI CCs
         if P::MIDI_INPUT >= MidiConfig::MidiCCs {
@@ -680,6 +701,7 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
         let num_actual_params = self.inner.param_hashes.len() as i32;
         // DELTON FORK DELTA: hpre-3
         let num_program_params = self.num_program_params();
+        let num_midi_preset_params = self.num_midi_preset_params();
         if num_program_params == 1 && param_index == num_actual_params {
             info.id = VST3_PROGRAM_PARAM_ID;
             u16strlcpy(&mut info.title, "Program");
@@ -689,11 +711,32 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
             info.unitId = kRootUnitId;
             // Not `kCanAutomate`: a project does not record preset changes as automation
             info.flags = ParameterFlags_::kIsProgramChange | ParameterFlags_::kIsList;
+        } else if num_midi_preset_params > 0
+            && param_index > num_actual_params
+            && param_index <= num_actual_params + num_midi_preset_params
+        {
+            // DELTON FORK DELTA: hpre-3b: the hidden MIDI bank select / program change
+            // parameters, per channel: bank MSB, bank LSB, program
+            let relative = (param_index - num_actual_params - num_program_params) as u32;
+            let channel = relative / 3;
+            let name = match relative % 3 {
+                0 => format!("MIDI Ch. {} Bank MSB", channel + 1),
+                1 => format!("MIDI Ch. {} Bank LSB", channel + 1),
+                _ => format!("MIDI Ch. {} Program", channel + 1),
+            };
+
+            info.id = midi_preset_param_id(channel as u8, (relative % 3) as u8);
+            u16strlcpy(&mut info.title, &name);
+            u16strlcpy(&mut info.shortTitle, &name);
+            info.stepCount = 127;
+            info.unitId = kRootUnitId;
+            info.flags = ParameterFlags_::kIsReadOnly | (1 << 4); // kIsHidden
         } else if P::MIDI_INPUT >= MidiConfig::MidiCCs
-            && param_index >= num_actual_params + num_program_params
+            && param_index >= num_actual_params + num_program_params + num_midi_preset_params
         {
             let midi_param_relative_idx =
-                (param_index - num_actual_params - num_program_params) as u32;
+                (param_index - num_actual_params - num_program_params - num_midi_preset_params)
+                    as u32;
             // This goes up to 130 for the 128 CCs followed by channel pressure and pitch bend
             let midi_cc = midi_param_relative_idx % VST3_MIDI_CCS;
             let midi_channel = midi_param_relative_idx / VST3_MIDI_CCS;
@@ -866,6 +909,11 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
             return program_to_normalized(current, self.inner.program_step_count());
         }
 
+        // DELTON FORK DELTA: hpre-3b: the MIDI bank select / program change parameters hold no value
+        if self.inner.has_midi_preset_params() && midi_preset_param(id).is_some() {
+            return 0.0;
+        }
+
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => unsafe { param_ptr.modulated_normalized_value() as f64 },
             _ => 0.5,
@@ -886,6 +934,12 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
                 return kInvalidArgument;
             }
             self.inner.load_program_from_value(value);
+            return kResultOk;
+        }
+
+        // DELTON FORK DELTA: hpre-3b: the MIDI bank select / program change parameters only act
+        // inside `process`; the host setting them from the UI does nothing
+        if self.inner.has_midi_preset_params() && midi_preset_param(id).is_some() {
             return kResultOk;
         }
 
@@ -1180,6 +1234,10 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                 self.inner.raw_automation.borrow_mut().clear();
             }
 
+            // DELTON FORK DELTA: hpre-3b
+            let mut midi_preset_changes = self.inner.midi_preset_changes.borrow_mut();
+            midi_preset_changes.clear();
+
             let push_process_event = |process_events: &mut AtomicRefMut<Vec<ProcessEvent<P>>>,
                                       event: ProcessEvent<P>| {
                 permit_alloc(|| {
@@ -1260,6 +1318,38 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                                     continue;
                                 }
 
+                                // DELTON FORK DELTA: hpre-3b: MIDI bank select and program change
+                                // have hidden parameters of their own. They are collected and
+                                // applied in sample offset order below, and never reach the
+                                // plugin's parameters, `raw_automation` or the process events
+                                // (bank select reaches a `MidiCCs` plugin as `MidiCC` events).
+                                if self.inner.has_midi_preset_params()
+                                    && let Some((channel, k)) = midi_preset_param(param_hash)
+                                {
+                                    let seq = midi_preset_changes.len() as u32;
+                                    permit_alloc(|| {
+                                        midi_preset_changes.push(MidiPresetChange {
+                                            timing,
+                                            k,
+                                            channel,
+                                            seq,
+                                            value: raw_value,
+                                        })
+                                    });
+                                    if P::MIDI_INPUT >= MidiConfig::MidiCCs && k < 2 {
+                                        push_process_event(
+                                            &mut process_events,
+                                            ProcessEvent::NoteEvent(NoteEvent::MidiCC {
+                                                timing,
+                                                channel,
+                                                cc: if k == 0 { 0 } else { 32 },
+                                                value,
+                                            }),
+                                        );
+                                    }
+                                    continue;
+                                }
+
                                 // MIDI CC messages, channel pressure, and pitch bend are also sent
                                 // as parameter changes
                                 if P::MIDI_INPUT >= MidiConfig::MidiCCs
@@ -1335,6 +1425,13 @@ impl<P: Vst3Plugin> IAudioProcessorTrait for Wrapper<P> {
                         }
                     }
                 }
+            }
+
+            // DELTON FORK DELTA: hpre-3b: the bank select and program change parameters' changes,
+            // in order: offset, then bank before program
+            if !midi_preset_changes.is_empty() {
+                self.inner
+                    .apply_midi_preset_changes(&mut midi_preset_changes);
             }
 
             // DELTON FORK DELTA
@@ -1800,22 +1897,30 @@ impl<P: Vst3Plugin> IMidiMappingTrait for Wrapper<P> {
         midi_cc_number: CtrlNumber,
         param_id: *mut ParamID,
     ) -> tresult {
-        // DELTON FORK DELTA: hpre-3: MIDI program change selects a program, on any channel
+        // DELTON FORK DELTA: hpre-3b: with the hidden MIDI bank select / program change
+        // parameters, CC 0 (bank MSB), CC 32 (bank LSB) and `kCtrlProgramChange` map to the
+        // channel's own parameter, so the host's program menu (the program parameter) and a MIDI
+        // program change are told apart. Without them, program change maps to nothing.
         if midi_cc_number == VST3_CTRL_PROGRAM_CHANGE {
-            let maps_to_program = bus_index == 0
-                && (0..VST3_MIDI_CHANNELS as i16).contains(&channel)
-                && P::MIDI_INPUT >= MidiConfig::Basic
-                && self
-                    .inner
-                    .host_presets
-                    .get()
-                    .is_some_and(|host_presets| host_presets.midi_program_change());
-            if !maps_to_program {
+            if !self.inner.has_midi_preset_params()
+                || bus_index != 0
+                || !(0..VST3_MIDI_CHANNELS as i16).contains(&channel)
+            {
                 return kResultFalse;
             }
 
             check_null_ptr!(param_id);
-            unsafe { *param_id = VST3_PROGRAM_PARAM_ID };
+            unsafe { *param_id = midi_preset_param_id(channel as u8, 2) };
+
+            return kResultOk;
+        }
+        if self.inner.has_midi_preset_params()
+            && (midi_cc_number == 0 || midi_cc_number == 32)
+            && bus_index == 0
+            && (0..VST3_MIDI_CHANNELS as i16).contains(&channel)
+        {
+            check_null_ptr!(param_id);
+            unsafe { *param_id = midi_preset_param_id(channel as u8, (midi_cc_number != 0) as u8) };
 
             return kResultOk;
         }

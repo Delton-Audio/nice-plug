@@ -32,6 +32,55 @@ pub const VST3_PROGRAM_PARAM_ID: u32 = VST3_MIDI_PARAMS_START - 1;
 // DELTON FORK DELTA: hpre-3
 pub const VST3_CTRL_PROGRAM_CHANGE: i16 = 130;
 
+/// The number of hidden parameters that carry MIDI bank select and program change: per channel the
+/// bank MSB (CC 0), the bank LSB (CC 32) and the program (`kCtrlProgramChange`).
+// DELTON FORK DELTA: hpre-3b
+pub const VST3_MIDI_PRESET_NUM_PARAMS: u32 = 3 * VST3_MIDI_CHANNELS;
+/// The start of the MIDI bank select / program change parameter range, just below the program
+/// parameter. The id of channel `c`'s parameter `k` (0 bank MSB, 1 bank LSB, 2 program) is
+/// `VST3_MIDI_PRESET_PARAMS_START + c * 3 + k`. A plugin parameter inside the range is a collision.
+// DELTON FORK DELTA: hpre-3b
+pub const VST3_MIDI_PRESET_PARAMS_START: u32 = VST3_PROGRAM_PARAM_ID - VST3_MIDI_PRESET_NUM_PARAMS;
+/// The (exclusive) end of the MIDI bank select / program change parameter range.
+// DELTON FORK DELTA: hpre-3b
+pub const VST3_MIDI_PRESET_PARAMS_END: u32 = VST3_PROGRAM_PARAM_ID;
+
+/// The MIDI bank select / program change parameter a parameter id is: `(channel, k)` with `k` 0
+/// for the bank MSB, 1 for the bank LSB and 2 for the program. `None` for any other id.
+// DELTON FORK DELTA: hpre-3b
+pub fn midi_preset_param(id: u32) -> Option<(u8, u8)> {
+    if !(VST3_MIDI_PRESET_PARAMS_START..VST3_MIDI_PRESET_PARAMS_END).contains(&id) {
+        return None;
+    }
+    let relative = id - VST3_MIDI_PRESET_PARAMS_START;
+    Some(((relative / 3) as u8, (relative % 3) as u8))
+}
+
+/// The id of channel `channel`'s MIDI bank select / program change parameter `k` (0 bank MSB, 1
+/// bank LSB, 2 program).
+// DELTON FORK DELTA: hpre-3b
+pub fn midi_preset_param_id(channel: u8, k: u8) -> u32 {
+    VST3_MIDI_PRESET_PARAMS_START + channel as u32 * 3 + k as u32
+}
+
+/// A MIDI value (0 to 127) from a parameter's normalized value.
+// DELTON FORK DELTA: hpre-3b
+pub fn midi_value_from_normalized(value: f64) -> u8 {
+    if value.is_nan() {
+        return 0;
+    }
+    (value.clamp(0.0, 1.0) * 127.0).round() as u8
+}
+
+/// The index into the program list that MIDI Program Change `program` selects while bank select
+/// holds `msb` and `lsb`: `(msb * 128 + lsb) * 128 + program`, a flat bank of 128 programs. The
+/// backend has the same function for CLAP and AU (the fork cannot depend on it), and both are
+/// tested on the same cases.
+// DELTON FORK DELTA: hpre-3b
+pub fn program_index(msb: u8, lsb: u8, program: u8) -> usize {
+    (msb as usize & 0x7f) * 128 * 128 + (lsb as usize & 0x7f) * 128 + (program as usize & 0x7f)
+}
+
 /// A list parameter's normalized value for program `index` of a list with `step_count + 1`
 /// programs (`index / step_count`; 0 for a list of one or none). An index past the list is the
 /// last program.
@@ -112,6 +161,46 @@ mod miri {
     #[test]
     fn program_param_id_is_just_below_the_midi_cc_range() {
         assert_eq!(VST3_PROGRAM_PARAM_ID + 1, VST3_MIDI_PARAMS_START);
+    }
+
+    #[test]
+    fn program_index_is_a_flat_bank_of_128_programs() {
+        assert_eq!(program_index(0, 0, 0), 0);
+        assert_eq!(program_index(0, 0, 5), 5);
+        assert_eq!(program_index(0, 1, 0), 128);
+        assert_eq!(program_index(0, 1, 5), 133);
+        assert_eq!(program_index(1, 0, 0), 128 * 128);
+        assert_eq!(program_index(1, 1, 0), 129 * 128);
+        assert_eq!(
+            program_index(127, 127, 127),
+            127 * 128 * 128 + 127 * 128 + 127
+        );
+        assert_eq!(program_index(127, 127, 127), 128 * 128 * 128 - 1);
+    }
+
+    #[test]
+    fn program_midi_preset_params_sit_below_the_program_parameter() {
+        assert_eq!(VST3_MIDI_PRESET_PARAMS_END, VST3_PROGRAM_PARAM_ID);
+        assert_eq!(VST3_MIDI_PRESET_PARAMS_START + 48, VST3_PROGRAM_PARAM_ID);
+        for channel in 0..16u8 {
+            for k in 0..3u8 {
+                let id = midi_preset_param_id(channel, k);
+                assert!((VST3_MIDI_PRESET_PARAMS_START..VST3_MIDI_PRESET_PARAMS_END).contains(&id));
+                assert_eq!(midi_preset_param(id), Some((channel, k)));
+            }
+        }
+        assert_eq!(midi_preset_param(VST3_PROGRAM_PARAM_ID), None);
+        assert_eq!(midi_preset_param(VST3_MIDI_PRESET_PARAMS_START - 1), None);
+    }
+
+    #[test]
+    fn program_midi_value_rounds_a_normalized_value() {
+        assert_eq!(midi_value_from_normalized(0.0), 0);
+        assert_eq!(midi_value_from_normalized(1.0 / 127.0), 1);
+        assert_eq!(midi_value_from_normalized(5.0 / 127.0), 5);
+        assert_eq!(midi_value_from_normalized(1.0), 127);
+        assert_eq!(midi_value_from_normalized(2.0), 127);
+        assert_eq!(midi_value_from_normalized(f64::NAN), 0);
     }
 
     #[test]

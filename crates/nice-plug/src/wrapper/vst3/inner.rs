@@ -25,7 +25,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use try_lock::TryLock;
 #[cfg(feature = "editor")]
 use vst3::ComWrapper;
@@ -40,8 +40,9 @@ use super::context::{WrapperActivateContext, WrapperProcessContext};
 use super::note_expressions::NoteExpressionController;
 use super::param_units::ParamUnits;
 use super::util::{
-    PROGRAM_LIST_ID, VST3_MIDI_PARAMS_END, VST3_MIDI_PARAMS_START, VST3_PROGRAM_PARAM_ID,
-    program_from_normalized,
+    PROGRAM_LIST_ID, VST3_MIDI_PARAMS_END, VST3_MIDI_PARAMS_START, VST3_MIDI_PRESET_NUM_PARAMS,
+    VST3_MIDI_PRESET_PARAMS_END, VST3_MIDI_PRESET_PARAMS_START, VST3_PROGRAM_PARAM_ID,
+    midi_value_from_normalized, program_from_normalized, program_index,
 };
 use crate::event_loop::{EventLoop, MainThreadExecutor, OsEventLoop};
 use crate::util::permit_alloc;
@@ -119,11 +120,34 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// audio thread never touches it.
     // DELTON FORK DELTA: hpre-3
     pub program_list: Mutex<Option<ProgramList>>,
-    /// The latest program change the audio thread saw: the program parameter's normalized value as
-    /// `f64` bits, or [`NO_PROGRAM_CHANGE`]. Taken by the `ProgramChange` task, which has the
-    /// list's step count to turn it into an index.
+    /// The latest program change the audio thread saw, as an INDEX into the program list (hpre-3b;
+    /// hpre-3 stored the program parameter's value): the index, with [`PLUGIN_LOAD`] set for a MIDI
+    /// program change (a plugin load) and clear for the program parameter (a host load), or
+    /// [`NO_PROGRAM_CHANGE`]. The kind is a tag in the same word as the index, so one store writes
+    /// both and the pair cannot tear; latest wins whichever source wrote it. Taken by the
+    /// `ProgramChange` task.
     // DELTON FORK DELTA: hpre-3
     pub program_change_pending: AtomicU64,
+    /// The program parameter's step count (programs minus one, 0 for none or one) as of the
+    /// cached list, so the audio thread can turn the parameter's normalized value into an index.
+    /// Written on the main thread wherever the cached list is set.
+    // DELTON FORK DELTA: hpre-3b
+    pub program_step_mirror: AtomicI32,
+    /// Whether the 48 hidden MIDI bank select / program change parameters exist: the wrapper has
+    /// [`HostPresets`], `P::MIDI_INPUT >= MidiConfig::Basic` and `midi_program_change()`. Read
+    /// once, when `host_presets` is set.
+    // DELTON FORK DELTA: hpre-3b
+    pub midi_preset_params: AtomicBool,
+    /// Per MIDI channel the bank select MSB (CC 0) and LSB (CC 32) the host last sent, 0 at
+    /// creation. They live as long as the wrapper: no reset, not saved.
+    // DELTON FORK DELTA: hpre-3b
+    pub midi_bank_msb: [AtomicU8; 16],
+    // DELTON FORK DELTA: hpre-3b
+    pub midi_bank_lsb: [AtomicU8; 16],
+    /// The changes of the 48 MIDI bank select / program change parameters in one `process` call,
+    /// sorted before they are applied. Preallocated; the audio thread only borrows it.
+    // DELTON FORK DELTA: hpre-3b
+    pub midi_preset_changes: AtomicRefCell<Vec<MidiPresetChange>>,
     /// Raised with a pending program change, so a burst posts one `ProgramChange` task.
     // DELTON FORK DELTA: hpre-3
     pub program_change_notice: NoticeFlag,
@@ -295,10 +319,68 @@ impl<P: Plugin> ProcessEvent<P> {
     }
 }
 
-/// The "no program change pending" value of [`WrapperInner::program_change_pending`]: a NaN, which
-/// the audio thread never stores.
+/// The "no program change pending" value of [`WrapperInner::program_change_pending`]: no index has
+/// all 64 bits set.
 // DELTON FORK DELTA: hpre-3
 pub const NO_PROGRAM_CHANGE: u64 = u64::MAX;
+
+/// The program parameter's `stepCount` for a list: the number of programs minus one, 0 for a list
+/// of one or none.
+// DELTON FORK DELTA: hpre-3b
+fn step_count_of(list: &ProgramList) -> i32 {
+    list.names.len().saturating_sub(1) as i32
+}
+
+/// What a `program_change_pending` word asks of the plugin: with [`PLUGIN_LOAD`] set,
+/// `program_change(index)` (a plugin load: the list NOW, the plugin tells the host); else a host
+/// load, `load_program(index, revision)`, with the revision `cached_revision(index)` read the
+/// list at (`None`: an empty list or an index it does not have, which loads nothing). An error
+/// from a host load is logged, not shown.
+// DELTON FORK DELTA: hpre-3b
+fn load_pending_with(
+    host_presets: &dyn HostPresets,
+    pending: u64,
+    cached_revision: impl FnOnce(usize) -> Option<u64>,
+) {
+    let index = (pending & !PLUGIN_LOAD) as usize;
+    if pending & PLUGIN_LOAD != 0 {
+        host_presets.program_change(index);
+        return;
+    }
+    if let Some(revision) = cached_revision(index)
+        && let Err(err) = host_presets.load_program(index, revision)
+    {
+        crate::nice_log!("The host's program change was not loaded: {}", err);
+    }
+}
+
+/// The tag in [`WrapperInner::program_change_pending`] of a program change that is a plugin load
+/// (a MIDI program change), not a host load (the program parameter).
+// DELTON FORK DELTA: hpre-3b
+pub const PLUGIN_LOAD: u64 = 1 << 62;
+
+/// One change of a MIDI bank select / program change parameter, as `process` collects them.
+// DELTON FORK DELTA: hpre-3b
+#[derive(Debug, Clone, Copy)]
+pub struct MidiPresetChange {
+    /// The change's sample offset in the buffer.
+    pub timing: u32,
+    /// 0 bank MSB, 1 bank LSB, 2 program: the order of equal offsets, so a bank change at the
+    /// same offset as a program change applies first.
+    pub k: u8,
+    pub channel: u8,
+    /// The order the host handed the points in, the last tie-break.
+    pub seq: u32,
+    /// The parameter's normalized value.
+    pub value: f64,
+}
+
+impl MidiPresetChange {
+    /// The order changes apply in: sample offset, then `k`, then channel, then arrival.
+    pub fn sort_key(&self) -> (u32, u8, u8, u32) {
+        (self.timing, self.k, self.channel, self.seq)
+    }
+}
 
 /// The VST3 end of the plugin's [`HostNotices`]: raises the wrapper's flag, and the call that
 /// raised it posts one `ParamValuesNotice` task.
@@ -402,6 +484,15 @@ impl<P: Vst3Plugin> WrapperInner<P> {
                     );
                 }
 
+                // DELTON FORK DELTA: hpre-3b
+                if (VST3_MIDI_PRESET_PARAMS_START..VST3_MIDI_PRESET_PARAMS_END).contains(hash) {
+                    crate::nice_debug_assert_failure!(
+                        "Parameter '{}' collides with a generated MIDI bank select / program \
+                         change parameter, consider giving it a different ID",
+                        id
+                    );
+                }
+
                 if P::MIDI_INPUT >= MidiConfig::MidiCCs
                     && (VST3_MIDI_PARAMS_START..VST3_MIDI_PARAMS_END).contains(hash)
                 {
@@ -472,6 +563,16 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             host_presets: OnceLock::new(),
             program_list: Mutex::new(None),
             program_change_pending: AtomicU64::new(NO_PROGRAM_CHANGE),
+            // DELTON FORK DELTA: hpre-3b
+            program_step_mirror: AtomicI32::new(0),
+            midi_preset_params: AtomicBool::new(false),
+            midi_bank_msb: std::array::from_fn(|_| AtomicU8::new(0)),
+            midi_bank_lsb: std::array::from_fn(|_| AtomicU8::new(0)),
+            // Room for every parameter's changes in a normal block; a larger block allocates
+            // (permitted, as for `process_events`)
+            midi_preset_changes: AtomicRefCell::new(Vec::with_capacity(
+                VST3_MIDI_PRESET_NUM_PARAMS as usize * 4,
+            )),
             program_change_notice: NoticeFlag::default(),
             program_list_notice: NoticeFlag::default(),
 
@@ -546,6 +647,13 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         // locks the plugin, which the audio thread may hold
         // DELTON FORK DELTA: hpre-3
         if let Some(host_presets) = wrapper.plugin.try_lock().unwrap().host_presets() {
+            // MIDI bank select and program change get hidden parameters of their own, so a MIDI
+            // program change and the host's program menu are told apart. Read once.
+            // DELTON FORK DELTA: hpre-3b
+            wrapper.midi_preset_params.store(
+                P::MIDI_INPUT >= MidiConfig::Basic && host_presets.midi_program_change(),
+                Ordering::Relaxed,
+            );
             let _ = wrapper.host_presets.set(host_presets);
         }
 
@@ -656,15 +764,30 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         // Read outside the lock: the plugin may tell us about a change while it answers
         let fresh = host_presets.program_list();
         let mut cached = self.program_list.lock();
-        Some(f(cached.get_or_insert(fresh)))
+        let list = cached.get_or_insert(fresh);
+        self.program_step_mirror
+            .store(step_count_of(list), Ordering::Relaxed);
+        Some(f(list))
+    }
+
+    /// Whether the 48 hidden MIDI bank select / program change parameters exist.
+    // DELTON FORK DELTA: hpre-3b
+    pub fn has_midi_preset_params(&self) -> bool {
+        self.has_programs() && self.midi_preset_params.load(Ordering::Relaxed)
+    }
+
+    /// Prime the cached program list (and with it the step count the audio thread reads), if it
+    /// was never read. Main thread only.
+    // DELTON FORK DELTA: hpre-3b
+    pub fn prime_program_list(&self) {
+        let _ = self.with_program_list(|_| ());
     }
 
     /// The program parameter's `stepCount`: the number of programs minus one, 0 for a list of one
     /// or none.
     // DELTON FORK DELTA: hpre-3
     pub fn program_step_count(&self) -> i32 {
-        self.with_program_list(|list| list.names.len().saturating_sub(1) as i32)
-            .unwrap_or(0)
+        self.with_program_list(step_count_of).unwrap_or(0)
     }
 
     /// Read the program list from the plugin again into the cache. Returns whether it differed
@@ -677,6 +800,8 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         let fresh = host_presets.program_list();
         let mut cached = self.program_list.lock();
         let changed = cached.as_ref().is_some_and(|old| *old != fresh);
+        self.program_step_mirror
+            .store(step_count_of(&fresh), Ordering::Relaxed);
         *cached = Some(fresh);
         changed
     }
@@ -708,14 +833,24 @@ impl<P: Vst3Plugin> WrapperInner<P> {
     }
 
     /// Called on the audio thread with the program parameter's last normalized value in a block:
-    /// the latest value wins, and a burst posts one `ProgramChange` task. Allocates nothing.
+    /// turns it into an index with the step count the main thread last mirrored, and makes it the
+    /// pending program change as a HOST load. Allocates nothing.
     // DELTON FORK DELTA: hpre-3
     pub fn post_program_change(&self, value: f64) {
         if !value.is_finite() {
             return;
         }
+        let step_count = self.program_step_mirror.load(Ordering::Relaxed);
+        self.post_program_index(program_from_normalized(value, step_count) as u64);
+    }
+
+    /// Makes `pending` (an index, with [`PLUGIN_LOAD`] set for a plugin load) the pending program
+    /// change, latest wins from any source, and posts one `ProgramChange` task for a burst.
+    /// Allocates nothing.
+    // DELTON FORK DELTA: hpre-3b
+    pub fn post_program_index(&self, pending: u64) {
         self.program_change_pending
-            .store(value.to_bits(), Ordering::Release);
+            .store(pending, Ordering::Release);
         if self.program_change_notice.raise() {
             // `post_gui`, never inline: the load runs on the main thread, never in `process`
             let posted = match self.event_loop.borrow().as_ref() {
@@ -729,28 +864,54 @@ impl<P: Vst3Plugin> WrapperInner<P> {
         }
     }
 
+    /// Apply the collected changes of the MIDI bank select / program change parameters, in sample
+    /// offset order, then `k` (a bank change at the same offset as a program change applies
+    /// first), then channel, then arrival. A bank parameter sets that channel's MSB / LSB; a
+    /// program parameter makes `program_index(msb, lsb, program)` the pending program change, as a
+    /// PLUGIN load. Audio thread; allocates nothing.
+    // DELTON FORK DELTA: hpre-3b
+    pub fn apply_midi_preset_changes(&self, changes: &mut [MidiPresetChange]) {
+        changes.sort_unstable_by_key(MidiPresetChange::sort_key);
+        for change in changes.iter() {
+            let channel = (change.channel & 0x0f) as usize;
+            let value = midi_value_from_normalized(change.value);
+            match change.k {
+                0 => self.midi_bank_msb[channel].store(value, Ordering::Relaxed),
+                1 => self.midi_bank_lsb[channel].store(value, Ordering::Relaxed),
+                _ => {
+                    let index = program_index(
+                        self.midi_bank_msb[channel].load(Ordering::Relaxed),
+                        self.midi_bank_lsb[channel].load(Ordering::Relaxed),
+                        value,
+                    );
+                    self.post_program_index(index as u64 | PLUGIN_LOAD);
+                }
+            }
+        }
+    }
+
     /// Load the program a program parameter value selects, as a host load. Does nothing for an
     /// empty list or an index the cached list does not have. An error from the plugin is logged,
     /// not shown. Main thread only.
     // DELTON FORK DELTA: hpre-3
     pub fn load_program_from_value(&self, value: f64) {
+        let step_count = self.program_step_count();
+        self.load_pending_program(program_from_normalized(value, step_count) as u64);
+    }
+
+    /// Load the program change a `program_change_pending` word holds: a host load of that index of
+    /// the cached list (nothing for an empty list or an index it does not have), or, with
+    /// [`PLUGIN_LOAD`] set, a plugin load of it (the plugin ignores an index past its list). An
+    /// error from the plugin is logged, not shown. Main thread only.
+    // DELTON FORK DELTA: hpre-3b
+    pub fn load_pending_program(&self, pending: u64) {
         let Some(host_presets) = self.host_presets.get() else {
             return;
         };
-        let target = self
-            .with_program_list(|list| {
-                if list.names.is_empty() {
-                    return None;
-                }
-                let index = program_from_normalized(value, (list.names.len() - 1) as i32);
-                (index < list.names.len()).then_some((index, list.revision))
-            })
-            .flatten();
-        if let Some((index, revision)) = target
-            && let Err(err) = host_presets.load_program(index, revision)
-        {
-            crate::nice_log!("The host's program change was not loaded: {}", err);
-        }
+        load_pending_with(host_presets.as_ref(), pending, |index| {
+            self.with_program_list(|list| (index < list.names.len()).then_some(list.revision))
+                .flatten()
+        });
     }
 
     /// Posts the task to the background task queue using [`EventLoop::schedule_background()`] so it
@@ -1028,7 +1189,7 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
                     .program_change_pending
                     .swap(NO_PROGRAM_CHANGE, Ordering::AcqRel);
                 if pending != NO_PROGRAM_CHANGE {
-                    self.load_program_from_value(f64::from_bits(pending));
+                    self.load_pending_program(pending);
                 }
             }
             // DELTON FORK DELTA: hpre-3
@@ -1094,5 +1255,76 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// Records which load the wrapper asked for.
+    #[derive(Default)]
+    struct Recorder {
+        calls: StdMutex<Vec<String>>,
+    }
+
+    impl HostPresets for Recorder {
+        fn load_file(&self, _path: &std::path::Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn program_list(&self) -> ProgramList {
+            ProgramList::default()
+        }
+        fn load_program(&self, index: usize, revision: u64) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("host load {index} at {revision}"));
+            Ok(())
+        }
+        fn current_program(&self) -> Option<usize> {
+            None
+        }
+        fn midi_program_change(&self) -> bool {
+            true
+        }
+        fn program_change(&self, index: usize) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("plugin load {index}"));
+        }
+    }
+
+    #[test]
+    fn program_pending_plugin_load_is_a_plugin_load_not_a_host_load() {
+        let recorder = Recorder::default();
+        // A MIDI program change: the list now, no revision, whatever the cached list says
+        load_pending_with(&recorder, 133 | PLUGIN_LOAD, |_| None);
+        load_pending_with(&recorder, 16_512 | PLUGIN_LOAD, |_| Some(9));
+        assert_eq!(
+            *recorder.calls.lock().unwrap(),
+            ["plugin load 133", "plugin load 16512"]
+        );
+    }
+
+    #[test]
+    fn program_pending_host_load_names_the_cached_revision() {
+        let recorder = Recorder::default();
+        load_pending_with(&recorder, 139, |index| (index < 140).then_some(7));
+        // An index the cached list does not have loads nothing
+        load_pending_with(&recorder, 140, |index| (index < 140).then_some(7));
+        assert_eq!(*recorder.calls.lock().unwrap(), ["host load 139 at 7"]);
+    }
+
+    #[test]
+    fn program_pending_tag_never_collides_with_none_or_an_index() {
+        assert_ne!(PLUGIN_LOAD, 0);
+        assert_ne!(NO_PROGRAM_CHANGE, PLUGIN_LOAD);
+        // The largest index a flat bank reaches
+        let largest = program_index(127, 127, 127) as u64;
+        assert_eq!(largest & PLUGIN_LOAD, 0);
+        assert_ne!(largest | PLUGIN_LOAD, NO_PROGRAM_CHANGE);
     }
 }
