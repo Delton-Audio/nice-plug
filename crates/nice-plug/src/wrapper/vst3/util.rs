@@ -18,8 +18,8 @@ pub const VST3_MIDI_PARAMS_START: u32 = VST3_MIDI_PARAMS_END - VST3_MIDI_NUM_PAR
 /// The (exclusive) end of the MIDI CC parameter range. Anything above this is reserved by the host.
 pub const VST3_MIDI_PARAMS_END: u32 = 1 << 31;
 
-/// The id of the one program list a plugin with [`HostPresets`] has. A program list id of 0 would
-/// be `kNoProgramListId`, so the id is 1.
+/// The id of the one program list a plugin with [`HostPresets`] has. Any id but
+/// `kNoProgramListId` (-1) would do; 1 is the one this wrapper uses.
 // DELTON FORK DELTA: hpre-3
 ///
 /// [`HostPresets`]: nice_plug_core::host_presets::HostPresets
