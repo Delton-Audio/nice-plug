@@ -1,20 +1,23 @@
 //! CLAP preset discovery: a plugin describes where its presets live and how to read one file's
 //! metadata, and the host's own preset browser lists them without ever creating the plugin.
-// DELTON FORK DELTA: hpre-2
+// DELTON FORK DELTA: hpre-2, pmeta-1b
 
 use clap_sys::factory::preset_discovery::{
-    CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT, CLAP_PRESET_DISCOVERY_IS_USER_CONTENT,
-    CLAP_PRESET_DISCOVERY_LOCATION_FILE, clap_preset_discovery_factory,
-    clap_preset_discovery_filetype, clap_preset_discovery_indexer, clap_preset_discovery_location,
-    clap_preset_discovery_location_kind, clap_preset_discovery_metadata_receiver,
-    clap_preset_discovery_provider, clap_preset_discovery_provider_descriptor,
+    CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT, CLAP_PRESET_DISCOVERY_IS_FAVORITE,
+    CLAP_PRESET_DISCOVERY_IS_USER_CONTENT, CLAP_PRESET_DISCOVERY_LOCATION_FILE,
+    clap_preset_discovery_factory, clap_preset_discovery_filetype, clap_preset_discovery_indexer,
+    clap_preset_discovery_location, clap_preset_discovery_location_kind,
+    clap_preset_discovery_metadata_receiver, clap_preset_discovery_provider,
+    clap_preset_discovery_provider_descriptor,
 };
+use clap_sys::timestamp::{CLAP_TIMESTAMP_UNKNOWN, clap_timestamp};
 use clap_sys::universal_plugin_id::clap_universal_plugin_id;
 use clap_sys::version::CLAP_VERSION;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What a plugin tells the host about its presets, with no plugin instance: the files' folders and
 /// how to read one file's metadata. Returned by
@@ -80,6 +83,35 @@ pub struct PresetMetadata {
     pub tags: Vec<String>,
     /// Factory or user: the preset's flags.
     pub content: PresetContent,
+    /// The preset's description; empty sends none (`set_description` is not called).
+    pub description: String,
+    /// Whether the user starred the preset: `CLAP_PRESET_DISCOVERY_IS_FAVORITE` is ORed into the
+    /// flags.
+    pub favorite: bool,
+    /// When the preset was created, if the OS says. With `modified`, sent through
+    /// `set_timestamps`.
+    pub created: Option<SystemTime>,
+    /// When the preset was last changed, if the OS says.
+    pub modified: Option<SystemTime>,
+}
+
+impl PresetMetadata {
+    /// The flags `set_flags` gets: the content flag, plus the favourite flag when starred.
+    pub fn clap_flags(&self) -> u32 {
+        let favorite = if self.favorite {
+            CLAP_PRESET_DISCOVERY_IS_FAVORITE
+        } else {
+            0
+        };
+        self.content.clap_flags() | favorite
+    }
+}
+
+/// A time as the seconds since the UNIX epoch CLAP wants: `CLAP_TIMESTAMP_UNKNOWN` (0) for `None`
+/// and for a time before 1970.
+fn clap_time(time: Option<SystemTime>) -> clap_timestamp {
+    time.and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(CLAP_TIMESTAMP_UNKNOWN, |since| since.as_secs())
 }
 
 /// A copy of `s` the host can keep reading: NUL-terminated, cut at the first NUL if it has one
@@ -355,12 +387,29 @@ unsafe extern "C" fn provider_get_metadata(
                     id: entry.clap_id.as_ptr(),
                 };
                 unsafe { add_plugin_id(receiver, &plugin_id) };
-                unsafe { set_flags(receiver, metadata.content.clap_flags()) };
+                unsafe { set_flags(receiver, metadata.clap_flags()) };
                 if let Some(add_creator) = receiver.add_creator {
                     for creator in &metadata.creators {
                         let creator = c_string_truncated(creator);
                         unsafe { add_creator(receiver, creator.as_ptr()) };
                     }
+                }
+                if !metadata.description.is_empty()
+                    && let Some(set_description) = receiver.set_description
+                {
+                    let description = c_string_truncated(&metadata.description);
+                    unsafe { set_description(receiver, description.as_ptr()) };
+                }
+                if (metadata.created.is_some() || metadata.modified.is_some())
+                    && let Some(set_timestamps) = receiver.set_timestamps
+                {
+                    unsafe {
+                        set_timestamps(
+                            receiver,
+                            clap_time(metadata.created),
+                            clap_time(metadata.modified),
+                        )
+                    };
                 }
                 if let Some(add_feature) = receiver.add_feature {
                     for tag in &metadata.tags {
@@ -392,6 +441,7 @@ unsafe extern "C" fn provider_get_extension(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::time::Duration;
 
     #[test]
     fn c_string_is_cut_at_the_first_nul() {
@@ -423,6 +473,8 @@ mod tests {
         plugin_ids: Vec<(String, String)>,
         flags: Vec<u32>,
         creators: Vec<String>,
+        descriptions: Vec<String>,
+        timestamps: Vec<(u64, u64)>,
         features: Vec<String>,
         errors: Vec<String>,
     }
@@ -518,6 +570,27 @@ mod tests {
             .push(text(creator));
     }
 
+    unsafe extern "C" fn set_description(
+        receiver: *const clap_preset_discovery_metadata_receiver,
+        description: *const c_char,
+    ) {
+        recorded(unsafe { (*receiver).receiver_data })
+            .borrow_mut()
+            .descriptions
+            .push(text(description));
+    }
+
+    unsafe extern "C" fn set_timestamps(
+        receiver: *const clap_preset_discovery_metadata_receiver,
+        creation_time: clap_timestamp,
+        modification_time: clap_timestamp,
+    ) {
+        recorded(unsafe { (*receiver).receiver_data })
+            .borrow_mut()
+            .timestamps
+            .push((creation_time, modification_time));
+    }
+
     unsafe extern "C" fn add_feature(
         receiver: *const clap_preset_discovery_metadata_receiver,
         feature: *const c_char,
@@ -550,6 +623,33 @@ mod tests {
                 creators: vec!["Sam".to_owned()],
                 tags: vec!["bass".to_owned(), "dark".to_owned()],
                 content: PresetContent::User,
+                description: "warm, round".to_owned(),
+                favorite: true,
+                created: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+                modified: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_500)),
+            })
+        } else if path.extension().is_some_and(|ext| ext == "bare") {
+            Ok(PresetMetadata {
+                name: "Bare".to_owned(),
+                creators: Vec::new(),
+                tags: Vec::new(),
+                content: PresetContent::Factory,
+                description: String::new(),
+                favorite: false,
+                created: None,
+                modified: None,
+            })
+        } else if path.extension().is_some_and(|ext| ext == "half") {
+            // One time the OS did not say, one before 1970
+            Ok(PresetMetadata {
+                name: "Half".to_owned(),
+                creators: Vec::new(),
+                tags: Vec::new(),
+                content: PresetContent::User,
+                description: String::new(),
+                favorite: false,
+                created: None,
+                modified: Some(UNIX_EPOCH - Duration::from_secs(5)),
             })
         } else if path.extension().is_some_and(|ext| ext == "panic") {
             panic!("a plugin bug");
@@ -642,8 +742,8 @@ mod tests {
             set_soundpack_id: None,
             set_flags: Some(set_flags),
             add_creator: Some(add_creator),
-            set_description: None,
-            set_timestamps: None,
+            set_description: Some(set_description),
+            set_timestamps: Some(set_timestamps),
             add_feature: Some(add_feature),
             add_extra_info: None,
         };
@@ -665,10 +765,55 @@ mod tests {
                 rec.plugin_ids,
                 vec![("clap".to_owned(), "audio.test.plugin".to_owned())]
             );
-            assert_eq!(rec.flags, vec![CLAP_PRESET_DISCOVERY_IS_USER_CONTENT]);
+            // The user content flag ORed with the favourite flag
+            assert_eq!(
+                rec.flags,
+                vec![CLAP_PRESET_DISCOVERY_IS_USER_CONTENT | CLAP_PRESET_DISCOVERY_IS_FAVORITE]
+            );
+            assert_eq!(rec.descriptions, vec!["warm, round".to_owned()]);
+            assert_eq!(rec.timestamps, vec![(1_700_000_000, 1_700_000_500)]);
             assert_eq!(rec.creators, vec!["Sam".to_owned()]);
             assert_eq!(rec.features, vec!["bass".to_owned(), "dark".to_owned()]);
             assert!(rec.errors.is_empty());
+        }
+
+        // No description, no favourite, no times: no description call and no timestamps call, and
+        // the flags are the content flag alone
+        assert!(unsafe {
+            get_metadata(
+                provider,
+                CLAP_PRESET_DISCOVERY_LOCATION_FILE,
+                c"/presets/factory/a.bare".as_ptr(),
+                &receiver,
+            )
+        });
+        {
+            let rec = record.borrow();
+            assert_eq!(rec.presets.len(), 2);
+            assert_eq!(rec.flags.len(), 2);
+            assert_eq!(rec.flags[1], CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT);
+            assert_eq!(
+                rec.descriptions.len(),
+                1,
+                "an empty description is not sent"
+            );
+            assert_eq!(rec.timestamps.len(), 1, "no times, no set_timestamps call");
+        }
+
+        // One time unknown (0) and one before 1970 (0)
+        assert!(unsafe {
+            get_metadata(
+                provider,
+                CLAP_PRESET_DISCOVERY_LOCATION_FILE,
+                c"/presets/user/a.half".as_ptr(),
+                &receiver,
+            )
+        });
+        {
+            let rec = record.borrow();
+            assert_eq!(rec.presets.len(), 3);
+            assert_eq!(rec.timestamps, vec![(1_700_000_000, 1_700_000_500), (0, 0)]);
+            assert_eq!(rec.descriptions.len(), 1);
         }
 
         // Not this plugin's file: false and an error, no preset
@@ -700,7 +845,7 @@ mod tests {
         });
         {
             let rec = record.borrow();
-            assert_eq!(rec.presets.len(), 1, "no error path begins a preset");
+            assert_eq!(rec.presets.len(), 3, "no error path begins a preset");
             assert_eq!(rec.errors.len(), 3);
             assert_eq!(rec.errors[0], "not a preset of this plugin");
         }
