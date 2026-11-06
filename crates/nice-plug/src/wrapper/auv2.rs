@@ -13,6 +13,8 @@ pub(crate) mod view_names;
 pub(crate) mod workgroup;
 // DELTON FORK DELTA: au-4b
 pub(crate) mod midi;
+// DELTON FORK DELTA: hpre-4
+pub(crate) mod presets;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod buffers;
@@ -30,6 +32,11 @@ pub(crate) mod sys;
 pub(crate) mod view;
 #[cfg(target_os = "macos")]
 pub(crate) mod wrapper;
+
+// DELTON FORK DELTA: hpre-4
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use presets::live_preset_blocks;
 
 use nice_plug_core::midi::MidiConfig;
 use nice_plug_core::plugin::Plugin;

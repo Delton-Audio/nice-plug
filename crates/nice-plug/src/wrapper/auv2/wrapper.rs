@@ -27,6 +27,8 @@ use nice_plug_core::editor::{Editor, EditorHandle, SpawnedEditor};
 // DELTON FORK DELTA: au-4b
 // DELTON FORK DELTA: hpre-1
 use nice_plug_core::host_notices::{HostNoticeSink, HostNotices};
+// DELTON FORK DELTA: hpre-4
+use nice_plug_core::host_presets::{HostPresets, ProgramList};
 use nice_plug_core::midi::{MidiConfig, NoteEvent, PluginNoteEvent};
 use nice_plug_core::params::internals::ParamPtr;
 use nice_plug_core::params::{ParamFlags, Params};
@@ -40,7 +42,7 @@ use std::ptr::{self, NonNull};
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use try_lock::TryLock;
 
@@ -57,6 +59,11 @@ use super::layout::{
 // DELTON FORK DELTA: au-4b
 use super::midi;
 use super::param_table::{au_from_normalized, normalized_from_au, AuParamKind, AuParamTable};
+// DELTON FORK DELTA: hpre-4
+use super::presets::{
+    apply_preset_set, current_preset, factory_presets_array, reread, run_load, with_cached,
+    PresentPreset, SetResult,
+};
 use super::render_check::{check_render, RenderCheck, RenderError};
 use super::state;
 use super::sys::*;
@@ -107,6 +114,17 @@ pub enum Task<P: AuPlugin> {
     /// listeners about every parameter. Posted by the plugin's [`HostNotices`].
     // DELTON FORK DELTA: hpre-1
     ParamValuesNotice,
+    /// The plugin's program list changed: re-read it and tell the `FactoryPresets` listeners.
+    /// Posted by `Wrapper::post_program_list_changed()`.
+    // DELTON FORK DELTA: hpre-4
+    ProgramListChanged,
+    /// The plugin loaded a preset itself: tells the `PresentPreset` listeners.
+    // DELTON FORK DELTA: hpre-4
+    PresentPresetChanged,
+    /// A `PresentPreset` set from a thread that is not the main one: the load of program `index` of
+    /// the list at `revision`, run on the main thread.
+    // DELTON FORK DELTA: hpre-4
+    LoadProgram { index: usize, revision: u64 },
     /// The editor asked for a new size: resize its container (main thread).
     // DELTON FORK DELTA: au-2
     #[cfg(feature = "editor")]
@@ -479,6 +497,21 @@ pub(crate) struct Wrapper<P: AuPlugin> {
     /// taken by the `ParamValuesNotice` task, so a burst of notices posts one task.
     // DELTON FORK DELTA: hpre-1
     param_values_notice: NoticeFlag,
+    /// The plugin's presets as the host's `FactoryPresets` and `PresentPreset`, asked for once at
+    /// Open. With `None` the unit has no factory presets.
+    // DELTON FORK DELTA: hpre-4
+    host_presets: OnceLock<Arc<dyn HostPresets>>,
+    /// The program list as last read: the list the host's `presetNumber` indexes into. Read on the
+    /// main thread only (first use, `FactoryPresets` gets, change notices); see `presets.rs`.
+    // DELTON FORK DELTA: hpre-4
+    program_list: Mutex<Option<ProgramList>>,
+    /// Raised when the program list changed, so a burst posts one `ProgramListChanged` task.
+    // DELTON FORK DELTA: hpre-4
+    program_list_notice: NoticeFlag,
+    /// Raised when the plugin loaded a preset itself, so a burst posts one `PresentPresetChanged`
+    /// task.
+    // DELTON FORK DELTA: hpre-4
+    present_preset_notice: NoticeFlag,
 
     // Configuration: only changed while uninitialized, read by render.
     /// The element structure shared by every layout this unit offers.
@@ -506,7 +539,8 @@ pub(crate) struct Wrapper<P: AuPlugin> {
     bypassed: AtomicBool,
     /// `ShouldAllocateBuffer` for the input and output scope.
     should_allocate: [AtomicU32; 2],
-    pub(super) present_preset_name: Mutex<String>,
+    // DELTON FORK DELTA: hpre-4 (was `present_preset_name`, the name only)
+    pub(super) present_preset: Mutex<PresentPreset>,
     last_render_error: AtomicI32,
     last_logged_error: AtomicUsize,
     last_process_status: AtomicCell<ProcessStatus>,
@@ -709,6 +743,14 @@ impl<P: AuPlugin> Wrapper<P> {
             event_loop: AtomicRefCell::new(None),
             // DELTON FORK DELTA: hpre-1
             param_values_notice: NoticeFlag::default(),
+            // DELTON FORK DELTA: hpre-4
+            host_presets: OnceLock::new(),
+            // DELTON FORK DELTA: hpre-4
+            program_list: Mutex::new(None),
+            // DELTON FORK DELTA: hpre-4
+            program_list_notice: NoticeFlag::default(),
+            // DELTON FORK DELTA: hpre-4
+            present_preset_notice: NoticeFlag::default(),
 
             input_sources: (0..shape.input_elements())
                 .map(|_| AtomicCell::new(InputSource::None))
@@ -733,7 +775,8 @@ impl<P: AuPlugin> Wrapper<P> {
             current_process_mode: AtomicCell::new(ProcessMode::Realtime),
             bypassed: AtomicBool::new(false),
             should_allocate: [AtomicU32::new(1), AtomicU32::new(1)],
-            present_preset_name: Mutex::new(String::from("Untitled")),
+            // DELTON FORK DELTA: hpre-4
+            present_preset: Mutex::new(PresentPreset::default()),
             last_render_error: AtomicI32::new(NO_ERR),
             last_logged_error: AtomicUsize::new(0),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
@@ -789,6 +832,13 @@ impl<P: AuPlugin> Wrapper<P> {
             .attach_host_notices(HostNotices::new(Arc::new(AuHostNotices {
                 wrapper: Arc::downgrade(&wrapper),
             })));
+
+        // Asked once, as the VST3 and CLAP wrappers do: a host load goes through this handle and
+        // never locks the plugin, which the audio thread may hold. The lock is free here too.
+        // DELTON FORK DELTA: hpre-4
+        if let Some(host_presets) = wrapper.plugin.try_lock().unwrap().host_presets() {
+            let _ = wrapper.host_presets.set(host_presets);
+        }
 
         // The editor also needs to be initialized late so the async executor can work
         // DELTON FORK DELTA: au-2
@@ -860,6 +910,26 @@ impl<P: AuPlugin> Wrapper<P> {
         let event_loop = self.event_loop.borrow();
         match event_loop.as_ref() {
             Some(event_loop) => event_loop.schedule_gui(task),
+            None => false,
+        }
+    }
+
+    /// Whether the calling thread is the main thread.
+    // DELTON FORK DELTA: hpre-4 (moved out of the `editor` impl block: presets need it too)
+    pub(super) fn is_main_thread(&self) -> bool {
+        self.event_loop
+            .borrow()
+            .as_ref()
+            .is_some_and(|event_loop| event_loop.is_main_thread())
+    }
+
+    /// Posts the task to the main thread's queue, never running it inline (unlike
+    /// [`Self::schedule_gui()`] on the main thread). Returns `false` if the queue is full.
+    // DELTON FORK DELTA: hpre-4
+    #[must_use]
+    fn post_gui(&self, task: Task<P>) -> bool {
+        match self.event_loop.borrow().as_ref() {
+            Some(event_loop) => event_loop.post_gui(task),
             None => false,
         }
     }
@@ -1321,6 +1391,111 @@ impl<P: AuPlugin> Wrapper<P> {
         });
 
         NO_ERR
+    }
+
+    /// The plugin's `HostPresets`, `None` when it gave none.
+    // DELTON FORK DELTA: hpre-4
+    fn host(&self) -> Option<&dyn HostPresets> {
+        self.host_presets.get().map(|host| host.as_ref())
+    }
+
+    /// Post one `ProgramListChanged` task, however many notices come before it runs. Callable from
+    /// any thread. Posted, never run inline, so the host is not called back inside its own get.
+    // DELTON FORK DELTA: hpre-4
+    fn post_program_list_changed(&self) {
+        if self.program_list_notice.raise() && !self.post_gui(Task::ProgramListChanged) {
+            // The task queue is full and nothing is coming to clear the flag: clear it so the next
+            // notice tries again
+            self.program_list_notice.take();
+        }
+    }
+
+    /// Post one `PresentPresetChanged` task, however many notices come before it runs. Callable
+    /// from any thread.
+    ///
+    /// Only for a preset the PLUGIN loaded. Ableton takes a `PresentPreset` notice for a full
+    /// preset reload and re-reads every parameter (`docs/research/host-quirks/fl-ableton.md`, the
+    /// `setLatencySamples` entry), which is right for a real preset load and the reason nothing
+    /// else (latency, state) sends it.
+    // DELTON FORK DELTA: hpre-4
+    fn post_present_preset_changed(&self) {
+        if self.present_preset_notice.raise() && !self.post_gui(Task::PresentPresetChanged) {
+            self.present_preset_notice.take();
+        }
+    }
+
+    /// Reads the program list again; when it differs from the one the host has, tells the host
+    /// (a `FactoryPresets` notice, posted). Main thread only.
+    // DELTON FORK DELTA: hpre-4
+    fn refresh_program_list(&self) {
+        if let Some(host) = self.host()
+            && reread(&self.program_list, host)
+        {
+            self.post_program_list_changed();
+        }
+    }
+
+    /// What a `FactoryPresets` get returns (a +1 `CFArray`, as a raw pointer).
+    // DELTON FORK DELTA: hpre-4
+    fn factory_presets_value(&self) -> *const c_void {
+        let Some(host) = self.host() else {
+            return CFRetained::into_raw(CFArray::<CFType>::empty()).as_ptr() as *const c_void;
+        };
+        // The host asks for the list again when a listing that changed behind the plugin's back
+        // should show. Only the main thread may ask the plugin; elsewhere the cache answers
+        if self.is_main_thread() && reread(&self.program_list, host) {
+            self.post_program_list_changed();
+        }
+        with_cached(&self.program_list, factory_presets_array)
+    }
+
+    /// What a `PresentPreset` get returns: (presetNumber, name).
+    // DELTON FORK DELTA: hpre-4
+    pub(super) fn present_preset_now(&self) -> (i32, String) {
+        current_preset(
+            self.host(),
+            &self.program_list,
+            &self.present_preset,
+            self.is_main_thread(),
+        )
+    }
+
+    /// A `PresentPreset` set: a program of the list the host read loads it; a negative number is
+    /// the host's own user preset (only the name is kept).
+    // DELTON FORK DELTA: hpre-4
+    pub(super) fn set_present_preset(&self, number: i32, name: String) -> OSStatus {
+        let result = apply_preset_set(
+            self.host(),
+            &self.program_list,
+            &self.present_preset,
+            number,
+            name,
+            self.is_main_thread(),
+        );
+        match result {
+            SetResult::Done => NO_ERR,
+            SetResult::Refused => kAudioUnitErr_InvalidPropertyValue,
+            SetResult::LoadFailed(err) => {
+                self.log_failed_load(&err);
+                kAudioUnitErr_InvalidPropertyValue
+            }
+            SetResult::LoadLater { index, revision } => {
+                if self.post_gui(Task::LoadProgram { index, revision }) {
+                    NO_ERR
+                } else {
+                    crate::nice_warn!("AU: the task queue is full, dropping a preset load");
+                    kAudioUnitErr_CannotDoInCurrentContext
+                }
+            }
+        }
+    }
+
+    /// The plugin refused the host's preset load (most likely the list moved since the host read
+    /// it): log it and tell the host if the list is different now. Main thread only.
+    // DELTON FORK DELTA: hpre-4
+    fn log_failed_load(&self, err: &str) {
+        crate::nice_log!("AU: the preset load was refused: {}", err);
+        self.refresh_program_list();
     }
 
     /// Call every listener of property `id`. The matching entries are copied out first and called
@@ -1839,13 +2014,14 @@ impl<P: AuPlugin> Wrapper<P> {
                 put!(bypassed as u32)
             }
             Prop::LastRenderError => put!(self.last_render_error.swap(NO_ERR, Ordering::Relaxed)),
-            Prop::FactoryPresets => {
-                put!(CFRetained::into_raw(CFArray::<CFType>::empty()).as_ptr() as *const c_void)
-            }
+            // DELTON FORK DELTA: hpre-4
+            Prop::FactoryPresets => put!(self.factory_presets_value()),
             Prop::PresentPreset => {
-                let name = CFString::from_str(&self.present_preset_name.lock());
+                // DELTON FORK DELTA: hpre-4
+                let (number, name) = self.present_preset_now();
+                let name = CFString::from_str(&name);
                 put!(AUPreset {
-                    presetNumber: -1,
+                    presetNumber: number,
                     presetName: CFRetained::into_raw(name).as_ptr(),
                 })
             }
@@ -2113,7 +2289,11 @@ impl<P: AuPlugin> Wrapper<P> {
                     // SAFETY: Checked for null above; the host owns the string for this call.
                     unsafe { &*preset.presetName }.to_string()
                 };
-                *self.present_preset_name.lock() = name;
+                // DELTON FORK DELTA: hpre-4
+                let status = self.set_present_preset(preset.presetNumber, name);
+                if status != NO_ERR {
+                    return status;
+                }
             }
             Prop::OfflineRender => {
                 let mode = if take!(u32) != 0 {
@@ -2719,14 +2899,6 @@ impl<P: AuPlugin> Wrapper<P> {
         }))
     }
 
-    /// Whether the calling thread is the main thread.
-    pub(super) fn is_main_thread(&self) -> bool {
-        self.event_loop
-            .borrow()
-            .as_ref()
-            .is_some_and(|event_loop| event_loop.is_main_thread())
-    }
-
     /// Get the plugin's state object, may be called by the plugin's GUI as part of its own preset
     /// management.
     pub(super) fn get_state_object(&self) -> PluginState {
@@ -2965,14 +3137,27 @@ impl<P: AuPlugin> HostNoticeSink for AuHostNotices<P> {
         }
     }
 
+    /// The plugin loaded a preset itself (its UI, a MIDI program change): the host re-reads
+    /// `PresentPreset`. A host load (a `PresentPreset` set) never comes through here: the host asked.
+    ///
+    /// Ableton takes a `PresentPreset` notice for a full preset reload and re-reads every
+    /// parameter (`docs/research/host-quirks/fl-ableton.md`, the `setLatencySamples` entry). That
+    /// is right for a real preset load, and why nothing else (latency, state) sends one.
     // DELTON FORK DELTA: hpre-2
+    // DELTON FORK DELTA: hpre-4
     fn preset_loaded(&self, _path: &std::path::Path) {
-        // AU has no preset-browser hook for this; the factory presets list (hpre-4) tells the host.
+        if let Some(wrapper) = self.wrapper.upgrade() {
+            wrapper.post_present_preset_changed();
+        }
     }
 
+    /// The program list changed: the host re-reads `FactoryPresets`.
     // DELTON FORK DELTA: hpre-3
+    // DELTON FORK DELTA: hpre-4
     fn program_list_changed(&self) {
-        // hpre-4: FactoryPresets
+        if let Some(wrapper) = self.wrapper.upgrade() {
+            wrapper.post_program_list_changed();
+        }
     }
 }
 
@@ -3028,6 +3213,39 @@ impl<P: AuPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                         AudioUnitEventType::ParameterValueChange,
                         entry.id,
                     );
+                }
+            }
+            // DELTON FORK DELTA: hpre-4
+            Task::ProgramListChanged => {
+                // Take the flag *before* the list is read, so a change that lands after this
+                // raises it again and posts a new task
+                self.program_list_notice.take();
+                if let Some(host) = self.host() {
+                    reread(&self.program_list, host);
+                    self.notify_property(
+                        kAudioUnitProperty_FactoryPresets,
+                        kAudioUnitScope_Global,
+                        0,
+                    );
+                }
+            }
+            // DELTON FORK DELTA: hpre-4
+            Task::PresentPresetChanged => {
+                self.present_preset_notice.take();
+                self.notify_property(kAudioUnitProperty_PresentPreset, kAudioUnitScope_Global, 0);
+            }
+            // DELTON FORK DELTA: hpre-4
+            Task::LoadProgram { index, revision } => {
+                if let Some(host) = self.host()
+                    && let Err(err) = run_load(
+                        host,
+                        &self.program_list,
+                        &self.present_preset,
+                        index,
+                        revision,
+                    )
+                {
+                    self.log_failed_load(&err);
                 }
             }
             // DELTON FORK DELTA: au-2

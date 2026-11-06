@@ -65,7 +65,8 @@ pub(crate) fn get_class_info<P: AuPlugin>(
     set_number("subtype", codes.subtype);
     set_number("manufacturer", codes.manufacturer);
 
-    let name = CFString::from_str(&wrapper.present_preset_name.lock());
+    // DELTON FORK DELTA: hpre-4 (what a `PresentPreset` get would return)
+    let name = CFString::from_str(&wrapper.present_preset_now().1);
     dictionary.set(&CFString::from_static_str("name"), &name);
 
     let data = CFData::from_bytes(&serialized);
@@ -134,7 +135,8 @@ pub(crate) unsafe fn set_class_info<P: AuPlugin>(
     }
 
     if let Some(name) = entry::<CFString>(&dictionary, "name") {
-        *wrapper.present_preset_name.lock() = name.to_string();
+        // DELTON FORK DELTA: hpre-4 (the name of a host user preset, as a `PresentPreset` set of -1)
+        wrapper.set_present_preset(-1, name.to_string());
     }
 
     // JUCE saves through AUBase, which writes its own parameter blob under `data`, and adds

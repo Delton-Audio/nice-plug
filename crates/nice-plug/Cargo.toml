@@ -163,3 +163,11 @@ name = "auv2_view"
 path = "tests/auv2_view.rs"
 harness = false
 required-features = ["auv2", "editor"]
+
+# DELTON FORK DELTA (hpre-4): the AU presets test needs the real main thread (the wrapper runs a load
+# inline there and delivers property notices from the main run loop), so it has its own main()
+[[test]]
+name = "auv2_presets"
+path = "tests/auv2_presets.rs"
+harness = false
+required-features = ["auv2"]
