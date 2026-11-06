@@ -134,20 +134,29 @@ pub(crate) unsafe fn set_class_info<P: AuPlugin>(
         return kAudioUnitErr_InvalidPropertyValue;
     }
 
-    if let Some(name) = entry::<CFString>(&dictionary, "name") {
-        // DELTON FORK DELTA: hpre-4 (the name of a host user preset, as a `PresentPreset` set of -1)
-        wrapper.set_present_preset(-1, name.to_string());
-    }
+    // The name of a host user preset, as a `PresentPreset` set of -1. Kept AFTER the state is
+    // applied, so the preset it is compared with is the one the state restored: a saved project or
+    // `.aupreset` reads back its own name until the plugin's preset changes.
+    // DELTON FORK DELTA: hpre-4
+    let name = entry::<CFString>(&dictionary, "name").map(|name| name.to_string());
+    let keep_name = |name: Option<String>| {
+        if let Some(name) = name {
+            wrapper.set_present_preset(-1, name);
+        }
+    };
 
     // JUCE saves through AUBase, which writes its own parameter blob under `data`, and adds
     // `jucePluginState` beside it. Our own state never has that key, so it decides which this is.
     if let Some(juce_state) = entry::<CFData>(&dictionary, "jucePluginState") {
-        return foreign_state_hook(&juce_state.to_vec());
+        let status = foreign_state_hook(&juce_state.to_vec());
+        keep_name(name);
+        return status;
     }
 
     if let Some(data) = entry::<CFData>(&dictionary, "data") {
         if data.len() > MAX_STATE_BYTES {
             crate::nice_error!("AU: state is too large ({} bytes), ignoring it", data.len());
+            keep_name(name);
             return NO_ERR;
         }
 
@@ -162,6 +171,7 @@ pub(crate) unsafe fn set_class_info<P: AuPlugin>(
         }
     }
 
+    keep_name(name);
     NO_ERR
 }
 
